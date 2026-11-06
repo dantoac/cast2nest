@@ -28,11 +28,11 @@ HTTP). Con Ctrl-C la pista actual sigue en el dispositivo hasta terminar o
 hasta que uses `stop`; al final de la playlist cortamos la app automaticamente.
 """
 import argparse
-import functools
 import hashlib
 import json
 import os
 import re
+import secrets
 import select
 import shutil
 import socket
@@ -40,7 +40,6 @@ import ssl
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -57,7 +56,6 @@ APP_DEFAULT = "CC1AD845"  # Default Media Receiver
 # el resto (ogg, m4a, opus, etc.) se convierte UNA VEZ a mp3 con ffmpeg y queda
 # cacheado en CACHE_DIR: se sirve después con Range/Length como un mp3 nativo
 NATIVE = {'.mp3': 'audio/mpeg', '.flac': 'audio/flac', '.wav': 'audio/wav'}
-STREAM_PATH = "/stream.mp3"
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "cast_audio")
 # extensiones a descubrir al expandir directorios
 AUDIO_EXT = {".mp3", ".flac", ".wav", ".ogg", ".oga", ".opus", ".m4a", ".aac",
@@ -496,12 +494,20 @@ class QuietHandler(SimpleHTTPRequestHandler):
 
 
 class RangeFileHandler(QuietHandler):
-    """Archivo con Content-Length + Accept-Ranges + 206 (reintentos/resume del Cast)."""
+    """Archivo con Content-Length + Accept-Ranges + 206 (reintentos/resume del Cast).
+
+    Solo sirve las rutas registradas en `routes` (token aleatorio → archivo) y
+    solo al dispositivo Cast (`allowed_ip`): nunca expone el directorio."""
     CHUNK = 1 << 20
+    routes = {}
+    allowed_ip = None
 
     def do_GET(self):
-        fpath = self.translate_path(self.path)
-        if not os.path.isfile(fpath):
+        if self.allowed_ip and self.client_address[0] != self.allowed_ip:
+            self.send_error(403)
+            return
+        fpath = self.routes.get(urllib.parse.urlsplit(self.path).path)
+        if not fpath or not os.path.isfile(fpath):
             self.send_error(404)
             return
         size = os.path.getsize(fpath)
@@ -568,8 +574,27 @@ def _serve_on(handler, port):
     return _run(srv)
 
 
-def serve_dir(d, port):
-    return _serve_on(functools.partial(RangeFileHandler, directory=d), port)
+def cast_ip_of(cast_host):
+    try:
+        return socket.gethostbyname(cast_host)
+    except OSError:
+        return None
+
+
+def serve_files(port, cast_host):
+    """Servidor de archivos sueltos; registrar cada uno con `publish`."""
+    cast_ip = cast_ip_of(cast_host)
+    handler = type("Files", (RangeFileHandler,), {"routes": {}, "allowed_ip": cast_ip})
+    srv = _serve_on(handler, port)
+    srv.routes = handler.routes
+    return srv
+
+
+def publish(srv, path):
+    """Registra `path` bajo una ruta impredecible y devuelve esa ruta URL."""
+    route = f"/{secrets.token_urlsafe(16)}/{urllib.parse.quote(os.path.basename(path))}"
+    srv.routes[route] = path
+    return route
 
 
 def _run(srv):
@@ -667,11 +692,20 @@ def start_stdin_ffmpeg(flags, buf):
     return proc
 
 
-def serve_stdin(buf, port):
+def serve_stdin(buf, port, cast_host):
+    """Stream en vivo solo bajo una ruta aleatoria y solo para el Cast."""
     n_get = [0]
+    cast_ip = cast_ip_of(cast_host)
+    route = f"/{secrets.token_urlsafe(16)}/stream.mp3"
 
     class StdinHandler(QuietHandler):
         def do_GET(self):
+            if cast_ip and self.client_address[0] != cast_ip:
+                self.send_error(403)
+                return
+            if urllib.parse.urlsplit(self.path).path != route:
+                self.send_error(404)
+                return
             n_get[0] += 1
             buf.add_consumer()
             try:
@@ -686,7 +720,9 @@ def serve_stdin(buf, port):
             finally:
                 buf.drop_consumer()
 
-    return _serve_on(StdinHandler, port)
+    srv = _serve_on(StdinHandler, port)
+    srv.route = route
+    return srv
 
 
 # ────────────────────────── comandos ──────────────────────────
@@ -712,7 +748,6 @@ def cmd_play(host, port_cast, media_args, port_http, stdin_flags=None):
         sys.exit("✖ no hay pistas para reproducir")
     print(f"▶ playlist: {total} pista{'s' if total > 1 else ''}")
     srv = None
-    tmp_dir = None
     ok_tracks = 0
     try:
         sess = CastSession(host, port_cast)
@@ -729,15 +764,10 @@ def cmd_play(host, port_cast, media_args, port_http, stdin_flags=None):
                 url = payload
             elif kind == "file":
                 d, fn = payload
-                if srv is not None and getattr(srv, "served_dir", None) != d:
-                    srv.shutdown()
-                    srv = None
                 if srv is None:
-                    srv = serve_dir(d, port_http)
-                    srv.served_dir = d
-                if d.startswith(tempfile.gettempdir()):
-                    tmp_dir = d
-                url = f"http://{local_ip(host)}:{srv.listen_port}/{urllib.parse.quote(fn)}"
+                    srv = serve_files(port_http, host)
+                route = publish(srv, os.path.join(d, fn))
+                url = f"http://{local_ip(host)}:{srv.listen_port}{route}"
             app = ensure_app(sess)
             print(f"\n▶ [{i}/{total}] {title}")
             print(f"   URL: {url}")
@@ -764,8 +794,6 @@ def cmd_play(host, port_cast, media_args, port_http, stdin_flags=None):
     finally:
         if srv:
             srv.shutdown()
-        if tmp_dir:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def cmd_play_stdin(host, port_cast, flags, port_http):
@@ -774,7 +802,7 @@ def cmd_play_stdin(host, port_cast, flags, port_http):
         sys.exit("✖ para usar '-' se necesita ffmpeg")
     buf = LiveBuffer()
     proc = start_stdin_ffmpeg(flags, buf)
-    srv = serve_stdin(buf, port_http)
+    srv = serve_stdin(buf, port_http, host)
     if sys.stdin.isatty():
         print("⚠ esperando audio por stdin… (si es PCM crudo: "
               "--in-fmt s16le --in-rate 48000 --in-ch 2)")
@@ -792,7 +820,7 @@ def cmd_play_stdin(host, port_cast, flags, port_http):
         sess = CastSession(host, port_cast)
         app = ensure_app(sess)
         print(f"✔ {app.get('displayName', 'Default Media Receiver')} activa")
-        url = f"http://{local_ip(host)}:{srv.listen_port}{STREAM_PATH}"
+        url = f"http://{local_ip(host)}:{srv.listen_port}{srv.route}"
         print(f"▶ entrada estándar\n   URL: {url}")
         sess.load(app["transportId"], url, "audio/mpeg", "entrada estándar")
         sess.monitor()
