@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from itertools import islice
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -256,6 +257,23 @@ class StdinHandlerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(headers["content-type"], "audio/mpeg")
         self.assertEqual(body, b"")
+
+
+class LiveBufferTests(unittest.TestCase):
+    def test_fast_consumer_does_not_delete_chunks_for_a_slow_consumer(self):
+        buffer = cast2nest.LiveBuffer()
+        fast = buffer.add_consumer()
+        slow = buffer.add_consumer()
+        fast_stream = buffer.stream(fast)
+        slow_stream = buffer.stream(slow)
+        buffer.push(b"first")
+        buffer.push(b"second")
+
+        self.assertEqual(list(islice(fast_stream, 2)), [b"first", b"second"])
+        buffer.end()
+        self.assertEqual(list(slow_stream), [b"first", b"second"])
+        buffer.drop_consumer(fast)
+        buffer.drop_consumer(slow)
 
 
 class PlaybackTests(unittest.TestCase):

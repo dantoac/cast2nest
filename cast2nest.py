@@ -789,13 +789,18 @@ def _run(srv):
 
 class LiveBuffer:
     """Chunks con número de secuencia: 1 productor, N consumidores en vivo.
-    El consumidor avanza y poda los slots que ya pasó; el productor espera
-    (backpressure) si hay un consumidor activo y se superó el cap del buffer."""
+
+    Cada consumidor registra su próxima secuencia. Solo se podan los chunks
+    que todos los consumidores activos ya leyeron; sin consumidores se aplica
+    el límite de capacidad para acumular datos antes de la primera conexión.
+    """
 
     def __init__(self, cap=16 << 20):
         self.lock = threading.Condition()
         self.slots, self.seq, self.size = [], 0, 0
-        self.cap, self.eof, self.active = cap, False, 0
+        self.cap, self.eof = cap, False
+        self.consumers = {}
+        self.next_consumer_id = 0
 
     def push(self, b):
         with self.lock:
@@ -803,7 +808,7 @@ class LiveBuffer:
             self.seq += 1
             self.size += len(b)
             self.lock.notify_all()
-            while self.size > self.cap and self.active > 0:
+            while self.size > self.cap and self.consumers:
                 self.lock.wait(0.2)
             while self.size > self.cap and len(self.slots) > 1:
                 _, old = self.slots.pop(0)
@@ -814,27 +819,44 @@ class LiveBuffer:
             self.eof = True
             self.lock.notify_all()
 
-    def add_consumer(self):
+    def add_consumer(self, from_live=False):
+        """Registra un consumidor y devuelve su identificador."""
         with self.lock:
-            self.active += 1
-
-    def drop_consumer(self):
-        with self.lock:
-            self.active -= 1
-            self.lock.notify_all()
-
-    def stream(self, from_live=False):
-        """Generador de chunks; from_live: arranca en la posición actual (reintentos)."""
-        with self.lock:
-            nxt = (
+            self.next_consumer_id += 1
+            consumer_id = self.next_consumer_id
+            self.consumers[consumer_id] = (
                 self.seq
                 if from_live
                 else (self.slots[0][0] if self.slots else self.seq)
             )
+            return consumer_id
+
+    def drop_consumer(self, consumer_id):
+        with self.lock:
+            self.consumers.pop(consumer_id, None)
+            self._prune_consumed()
+            self.lock.notify_all()
+
+    def _prune_consumed(self):
+        """Quita chunks superados por todos; el lock ya está adquirido."""
+        if not self.consumers:
+            self.slots.clear()
+            self.size = 0
+            return
+        oldest_needed = min(self.consumers.values())
+        while self.slots and self.slots[0][0] < oldest_needed:
+            _, old = self.slots.pop(0)
+            self.size -= len(old)
+
+    def stream(self, consumer_id):
+        """Generador de chunks para un consumidor registrado."""
         while True:
             got = None
             with self.lock:
                 while True:
+                    nxt = self.consumers.get(consumer_id)
+                    if nxt is None:
+                        return
                     for s, b in self.slots:
                         if s >= nxt:
                             nxt, got = s, b
@@ -842,12 +864,11 @@ class LiveBuffer:
                     if got is not None or self.eof:
                         break
                     self.lock.wait(0.5)
-                if got is None:  # eof sin más datos para nuestro nxt
+                if got is None:  # eof sin más datos para este consumidor
                     return
-                nxt += 1
-                while self.slots and self.slots[0][0] < nxt:
-                    _, old = self.slots.pop(0)
-                    self.size -= len(old)
+                self.consumers[consumer_id] = nxt + 1
+                self._prune_consumed()
+                self.lock.notify_all()
             yield got
 
 
@@ -918,18 +939,18 @@ def serve_stdin(buf, port, cast_ip):
             if not self._authorized():
                 return
             n_get[0] += 1
-            buf.add_consumer()
+            consumer_id = buf.add_consumer(from_live=n_get[0] > 1)
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "audio/mpeg")
                 self.send_header("Connection", "close")
                 self.end_headers()
-                for chunk in buf.stream(from_live=n_get[0] > 1):
+                for chunk in buf.stream(consumer_id):
                     self.wfile.write(chunk)
             except (BrokenPipeError, ConnectionResetError):
                 pass
             finally:
-                buf.drop_consumer()
+                buf.drop_consumer(consumer_id)
 
     srv = _serve_on(StdinHandler, port)
     srv.route = route

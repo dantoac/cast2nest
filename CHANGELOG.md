@@ -19,4 +19,5 @@ The format follows Keep a Changelog and the project uses Semantic Versioning.
 - Return HTTP 416 for unsatisfiable byte ranges.
 - Report Cast load and decode failures as unsuccessful playback.
 - Return a failure exit status when standard-input playback fails.
+- Preserve live chunks until every active consumer has read them.
 - Use the `cast2nest` name consistently in the CLI, metadata, and cache.
