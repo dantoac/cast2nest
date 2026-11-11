@@ -47,6 +47,7 @@ import threading
 import time
 import urllib.parse
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
 
 SRC_ID = "sender-0"
 NS_CONN = "urn:x-cast:com.google.cast.tp.connection"
@@ -321,17 +322,17 @@ class CastSession:
                 if (
                     m["ns"] == NS_RECV
                     and (m["json"] or {}).get("type") == "RECEIVER_STATUS"
-                ):
-                    if not any(
+                    and not any(
                         a.get("appId") == APP_DEFAULT
                         for a in m["json"]["status"].get("applications", [])
-                    ):
-                        print(
-                            "■ la app de reproducción se cerró"
-                            + ("" if played else " sin llegar a sonar")
-                        )
-                        ok = played
-                        break
+                    )
+                ):
+                    print(
+                        "■ la app de reproducción se cerró"
+                        + ("" if played else " sin llegar a sonar")
+                    )
+                    ok = played
+                    break
                 if m["ns"] != NS_MEDIA:
                     continue
                 payload = m["json"] or {}
@@ -415,12 +416,15 @@ def pick_host():
 
 
 def is_url(s):
-    return s.startswith("http://") or s.startswith("https://")
+    return s.startswith(("http://", "https://"))
 
 
 def has_encoder(name):
     out = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True
+        ["ffmpeg", "-hide_banner", "-encoders"],
+        check=False,
+        capture_output=True,
+        text=True,
     ).stdout
     return name in out
 
@@ -441,6 +445,7 @@ def media_title(path, preset=None):
                 "default=nw=1:nk=1",
                 path,
             ],
+            check=False,
             capture_output=True,
             text=True,
             timeout=10,
@@ -507,6 +512,7 @@ def ffmpeg_convert(src, dst, enc, out_fmt=None):
             "default=nw=1:nk=1",
             src,
         ],
+        check=False,
         capture_output=True,
         text=True,
         timeout=15,
@@ -545,18 +551,21 @@ def ffmpeg_convert(src, dst, enc, out_fmt=None):
             except ValueError:
                 pct = ""
             print(f"\r⟳ convirtiendo… {pct}        ", end="", flush=True)
-        elif k not in (
-            "frame",
-            "fps",
-            "bitrate",
-            "total_size",
-            "progress",
-            "speed",
-            "drop_frames",
-            "multiframe",
+        elif (
+            k
+            not in (
+                "frame",
+                "fps",
+                "bitrate",
+                "total_size",
+                "progress",
+                "speed",
+                "drop_frames",
+                "multiframe",
+            )
+            and line
         ):
-            if line:
-                err.append(line)
+            err.append(line)
     proc.wait()
     print("\r" + " " * 32 + "\r", end="", flush=True)
     return proc.returncode, ("; ".join(err[-2:]) if err else "")
@@ -637,7 +646,7 @@ class RangeFileHandler(QuietHandler):
     """
 
     CHUNK = 1 << 20
-    routes: dict[str, str] = {}
+    routes: ClassVar[dict[str, str]] = {}
     allowed_ip = None
 
     def do_GET(self):

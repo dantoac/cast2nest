@@ -117,7 +117,7 @@ python3 -m unittest discover -s tests -v
 Optional static checks:
 
 ```sh
-python3 -m pip install ruff mypy
+python3 -m pip install -r requirements-dev.txt
 ruff check .
 ruff format --check .
 mypy --ignore-missing-imports cast2nest.py

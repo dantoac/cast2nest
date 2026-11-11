@@ -226,9 +226,9 @@ class RangeFileHandlerTests(unittest.TestCase):
         with (
             patch.object(cast2nest, "cast_ip_of", return_value=None),
             patch.object(cast2nest, "_serve_on") as serve,
+            self.assertRaises(ConnectionError),
         ):
-            with self.assertRaises(ConnectionError):
-                cast2nest.serve_files(8099, "unresolved.invalid")
+            cast2nest.serve_files(8099, "unresolved.invalid")
         serve.assert_not_called()
 
 
@@ -293,9 +293,9 @@ class PlaybackTests(unittest.TestCase):
             patch.object(cast2nest, "local_ip", return_value="192.0.2.2"),
             patch.object(cast2nest.time, "sleep"),
             patch.object(cast2nest.sys.stdin, "isatty", return_value=True),
+            self.assertRaises(SystemExit) as raised,
         ):
-            with self.assertRaises(SystemExit) as raised:
-                cast2nest.cmd_play_stdin("cast.local", 8009, {}, 8099)
+            cast2nest.cmd_play_stdin("cast.local", 8009, {}, 8099)
         self.assertNotIn(raised.exception.code, (None, 0))
 
 
