@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Daniel Aguayo
+# SPDX-License-Identifier: GPL-3.0-or-later
 # -*- coding: utf-8 -*-
 """
-cast_audio.py — Envía audio a un dispositivo Google Cast (Nest Mini, Chromecast, etc.)
+cast2nest.py — Envía audio a un dispositivo Google Cast (Nest Mini, Chromecast, etc.)
 usando SOLO la stdlib de Python: sin pip, sin pychromecast.
 
 Protocolo CastV2 implementado a mano:
@@ -13,13 +15,13 @@ Protocolo CastV2 implementado a mano:
     con Content-Length + Range, para reintentos/curación de cortes)
 
 Uso:
-  python3 cast_audio.py [--host IP] play  PISTAS...     # 1+ archivo|URL, o un
+  python3 cast2nest.py [--host IP] play  PISTAS...      # 1+ archivo|URL, o un
       # directorio entero (filtrado por audio), o una playlist .m3u/.m3u8
-  python3 cast_audio.py [--host IP] play - < audio.mp3   # pipa desde otra app
+  python3 cast2nest.py [--host IP] play - < audio.mp3    # pipa desde otra app
       # audio crudo por pipa: agrega --raw (o fino con --in-fmt/--in-rate/--in-ch)
-  python3 cast_audio.py [--host IP] volume NIVEL          # 0..100
-  python3 cast_audio.py [--host IP] stop
-  python3 cast_audio.py [--host IP] status
+  python3 cast2nest.py [--host IP] volume NIVEL           # 0..100
+  python3 cast2nest.py [--host IP] stop
+  python3 cast2nest.py [--host IP] status
 
 Sin --host se descubre el Cast automáticamente escaneando el puerto 8009/24.
 
@@ -27,6 +29,7 @@ Nota: mientras reproduce, este proceso debe seguir vivo (sirve las pistas por
 HTTP). Con Ctrl-C la pista actual sigue en el dispositivo hasta terminar o
 hasta que uses `stop`; al final de la playlist cortamos la app automaticamente.
 """
+
 import argparse
 import hashlib
 import json
@@ -55,14 +58,27 @@ APP_DEFAULT = "CC1AD845"  # Default Media Receiver
 # solo se copian tal cual los formatos que TODOS los Cast decodifican seguro;
 # el resto (ogg, m4a, opus, etc.) se convierte UNA VEZ a mp3 con ffmpeg y queda
 # cacheado en CACHE_DIR: se sirve después con Range/Length como un mp3 nativo
-NATIVE = {'.mp3': 'audio/mpeg', '.flac': 'audio/flac', '.wav': 'audio/wav'}
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "cast_audio")
+NATIVE = {".mp3": "audio/mpeg", ".flac": "audio/flac", ".wav": "audio/wav"}
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "cast2nest")
 # extensiones a descubrir al expandir directorios
-AUDIO_EXT = {".mp3", ".flac", ".wav", ".ogg", ".oga", ".opus", ".m4a", ".aac",
-             ".mka", ".wma", ".aif", ".aiff"}
+AUDIO_EXT = {
+    ".mp3",
+    ".flac",
+    ".wav",
+    ".ogg",
+    ".oga",
+    ".opus",
+    ".m4a",
+    ".aac",
+    ".mka",
+    ".wma",
+    ".aif",
+    ".aiff",
+}
 
 
 # ────────────────── protobuf CastMessage (armado/parseo manual) ──────────────────
+
 
 def enc_varint(n):
     out = bytearray()
@@ -112,13 +128,13 @@ def parse_msg(buf):
             f[fn], i = dec_varint(buf, i)
         elif wt == 2:
             ln, i = dec_varint(buf, i)
-            f[fn] = buf[i:i + ln]
+            f[fn] = buf[i : i + ln]
             i += ln
         elif wt == 5:
-            f[fn] = buf[i:i + 4]
+            f[fn] = buf[i : i + 4]
             i += 4
         elif wt == 1:
-            f[fn] = buf[i:i + 8]
+            f[fn] = buf[i : i + 8]
             i += 8
         else:
             raise ValueError(f"wire type inesperado {wt}")
@@ -132,6 +148,7 @@ def parse_msg(buf):
 
 
 # ────────────────────────── sesión Cast ──────────────────────────
+
 
 class CastSession:
     def __init__(self, host, port=8009, timeout=8.0):
@@ -148,8 +165,11 @@ class CastSession:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         self.sock = ctx.wrap_socket(raw)
-        self.send(NS_CONN, "receiver-0",
-                  {"type": "CONNECT", "userAgent": "cast_audio.py", "ver": "2.0"})
+        self.send(
+            NS_CONN,
+            "receiver-0",
+            {"type": "CONNECT", "userAgent": "cast2nest.py", "ver": "2.0"},
+        )
         if do_auth:
             # AuthChallenge vacía (sin certificado de Google, como VLC)
             self.send_bin(NS_AUTH, "receiver-0", b"\x0a\x00")
@@ -159,8 +179,9 @@ class CastSession:
         self._do_auth = do_auth
 
     def send(self, ns, dst, obj):
-        self._raw(build_msg(SRC_ID, dst, ns,
-                            utf8=json.dumps(obj, separators=(",", ":"))))
+        self._raw(
+            build_msg(SRC_ID, dst, ns, utf8=json.dumps(obj, separators=(",", ":")))
+        )
 
     def send_bin(self, ns, dst, data):
         self._raw(build_msg(SRC_ID, dst, ns, binary=data))
@@ -203,24 +224,43 @@ class CastSession:
         self.req += 1
         rid = self.req
         self.send(NS_RECV, "receiver-0", {"type": "GET_STATUS", "requestId": rid})
-        m = self.wait(lambda m: m["ns"] == NS_RECV
-                      and (m["json"] or {}).get("type") == "RECEIVER_STATUS"
-                      and m["json"].get("requestId") in (None, rid), timeout=8)
+        m = self.wait(
+            lambda m: (
+                m["ns"] == NS_RECV
+                and (m["json"] or {}).get("type") == "RECEIVER_STATUS"
+                and m["json"].get("requestId") in (None, rid)
+            ),
+            timeout=8,
+        )
         if not m:
             raise RuntimeError("no llegó RECEIVER_STATUS del dispositivo")
         return m["json"]["status"]
 
     def launch(self, app_id):
         self.req += 1
-        self.send(NS_RECV, "receiver-0",
-                  {"type": "LAUNCH", "appId": app_id, "requestId": self.req})
-        m = self.wait(lambda m: m["ns"] == NS_RECV
-                      and (m["json"] or {}).get("type") == "RECEIVER_STATUS"
-                      and m["json"].get("status", {}).get("applications"), timeout=12)
+        self.send(
+            NS_RECV,
+            "receiver-0",
+            {"type": "LAUNCH", "appId": app_id, "requestId": self.req},
+        )
+        m = self.wait(
+            lambda m: (
+                m["ns"] == NS_RECV
+                and (m["json"] or {}).get("type") == "RECEIVER_STATUS"
+                and m["json"].get("status", {}).get("applications")
+            ),
+            timeout=12,
+        )
         if not m:
             raise RuntimeError("el dispositivo no lanzó la app de reproducción")
-        app = next((a for a in m["json"]["status"]["applications"]
-                    if a.get("appId") == app_id), None)
+        app = next(
+            (
+                a
+                for a in m["json"]["status"]["applications"]
+                if a.get("appId") == app_id
+            ),
+            None,
+        )
         if not app:
             raise RuntimeError(f"la app {app_id} no quedó activa")
         return app
@@ -230,17 +270,31 @@ class CastSession:
 
     def load(self, transport_id, url, ctype, title):
         self.req += 1
-        self.send(NS_MEDIA, transport_id,
-                  {"type": "LOAD", "requestId": self.req,
-                   "media": {"contentId": url, "streamType": "BUFFERED",
-                             "contentType": ctype,
-                             "metadata": {"metadataType": 3, "title": title,
-                                          "artist": "cast_audio.py"}},
-                   "autoplay": True, "currentTime": 0, "customData": {}})
+        self.send(
+            NS_MEDIA,
+            transport_id,
+            {
+                "type": "LOAD",
+                "requestId": self.req,
+                "media": {
+                    "contentId": url,
+                    "streamType": "BUFFERED",
+                    "contentType": ctype,
+                    "metadata": {
+                        "metadataType": 3,
+                        "title": title,
+                        "artist": "cast2nest.py",
+                    },
+                },
+                "autoplay": True,
+                "currentTime": 0,
+                "customData": {},
+            },
+        )
 
     def monitor(self):
-        """Devuelve True si la reproducción terminó bien/estaba sonando."""
-        seen, last, last_ping, ok = False, None, 0.0, False
+        """Devuelve True solo si la pista llegó a PLAYING y terminó sin error."""
+        played, last, last_ping, ok = False, None, 0.0, False
         icon = {"PLAYING": "▶", "PAUSED": "⏸", "BUFFERING": "…", "IDLE": "■"}
         while True:
             now = time.time()
@@ -254,42 +308,62 @@ class CastSession:
                 try:
                     m = self.recv_msg(timeout=2)
                 except (ConnectionError, ssl.SSLError, OSError):
-                    if not seen:
-                        print("■ el dispositivo cerró la conexión si llegar a "
-                              "sonar (¿rechazó el archivo?)")
-                    ok = seen
+                    if not played:
+                        print(
+                            "■ el dispositivo cerró la conexión sin llegar a "
+                            "sonar (¿rechazó el archivo?)"
+                        )
+                    ok = played
                     break
                 if m["ns"] == NS_HB and (m["json"] or {}).get("type") == "PING":
                     self.send(NS_HB, m["src"], {"type": "PONG"})
                     continue
-                if m["ns"] == NS_RECV and (m["json"] or {}).get("type") == "RECEIVER_STATUS":
-                    if not any(a.get("appId") == APP_DEFAULT
-                               for a in m["json"]["status"].get("applications", [])):
-                        print("■ la app de reproducción se cerró"
-                              + ("" if seen else " sin llegar a sonar"))
-                        ok = seen
+                if (
+                    m["ns"] == NS_RECV
+                    and (m["json"] or {}).get("type") == "RECEIVER_STATUS"
+                ):
+                    if not any(
+                        a.get("appId") == APP_DEFAULT
+                        for a in m["json"]["status"].get("applications", [])
+                    ):
+                        print(
+                            "■ la app de reproducción se cerró"
+                            + ("" if played else " sin llegar a sonar")
+                        )
+                        ok = played
                         break
-                if m["ns"] == NS_MEDIA and (m["json"] or {}).get("type") == "MEDIA_STATUS":
-                    s0 = (m["json"].get("status") or [{}])[0]
-                    ps = s0.get("playerState") or "IDLE"
-                    if ps != last:
-                        print(f"   {icon.get(ps, '·')} {ps}")
-                        last = ps
-                    if ps in ("PLAYING", "BUFFERING"):
-                        seen = True
-                    if ps == "IDLE":
-                        if seen:
-                            print("✔ reproducción terminada")
-                            ok = True
-                            break
-                        if s0.get("idleReason") == "ERROR":
-                            print("✖ el dispositivo no pudo decodificar el "
-                                  "archivo (¿formato no soportado o corrupto?)")
-                            break
+                if m["ns"] != NS_MEDIA:
+                    continue
+                payload = m["json"] or {}
+                msg_type = payload.get("type")
+                if msg_type in ("LOAD_FAILED", "LOAD_CANCELLED", "ERROR"):
+                    print(f"✖ el dispositivo rechazó la pista ({msg_type})")
+                    break
+                if msg_type != "MEDIA_STATUS":
+                    continue
+                s0 = (payload.get("status") or [{}])[0]
+                ps = s0.get("playerState") or "IDLE"
+                if ps != last:
+                    print(f"   {icon.get(ps, '·')} {ps}")
+                    last = ps
+                if ps == "PLAYING":
+                    played = True
+                if ps == "IDLE":
+                    if s0.get("idleReason") == "ERROR":
+                        print(
+                            "✖ el dispositivo no pudo decodificar el "
+                            "archivo (¿formato no soportado o corrupto?)"
+                        )
+                        break
+                    if played:
+                        print("✔ reproducción terminada")
+                        ok = True
+                        break
         return ok
 
 
 # ────────────────────────── descubrimiento y red ──────────────────────────
+
 
 def discover(timeout=0.8):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -307,12 +381,14 @@ def discover(timeout=0.8):
             with lock:
                 found.append(ip)
 
-    ths = [threading.Thread(target=probe, args=(f"{base}.{i}",), daemon=True)
-           for i in range(1, 255)]
+    ths = [
+        threading.Thread(target=probe, args=(f"{base}.{i}",), daemon=True)
+        for i in range(1, 255)
+    ]
     for i in range(0, len(ths), 64):
-        for t in ths[i:i + 64]:
+        for t in ths[i : i + 64]:
             t.start()
-        for t in ths[i:i + 64]:
+        for t in ths[i : i + 64]:
             t.join()
     return found
 
@@ -337,13 +413,15 @@ def pick_host():
 
 # ────────────────────────── preparación de medios ──────────────────────────
 
+
 def is_url(s):
     return s.startswith("http://") or s.startswith("https://")
 
 
 def has_encoder(name):
-    out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
-                         capture_output=True, text=True).stdout
+    out = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True
+    ).stdout
     return name in out
 
 
@@ -353,10 +431,20 @@ def media_title(path, preset=None):
         return preset
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries",
-             "format_tags=title:stream_tags=title",
-             "-of", "default=nw=1:nk=1", path],
-            capture_output=True, text=True, timeout=10)
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format_tags=title:stream_tags=title",
+                "-of",
+                "default=nw=1:nk=1",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
         for ln in r.stdout.splitlines():
             if ln.strip():
                 return ln.strip()
@@ -408,31 +496,65 @@ def expand_media_args(args_list):
 def ffmpeg_convert(src, dst, enc, out_fmt=None):
     """ffmpeg con progreso (línea que se actualiza). Devuelve (rc, error)."""
     total = None
-    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
-                        "format=duration", "-of", "default=nw=1:nk=1", src],
-                       capture_output=True, text=True, timeout=15)
+    r = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+            src,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
     try:
         total = float(r.stdout.strip().splitlines()[0])
     except (ValueError, IndexError):
         pass
     proc = subprocess.Popen(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
-         "-progress", "pipe:1", "-i", src, "-vn", *enc,
-         *( ["-f", out_fmt] if out_fmt else [] ), dst],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-progress",
+            "pipe:1",
+            "-i",
+            src,
+            "-vn",
+            *enc,
+            *(["-f", out_fmt] if out_fmt else []),
+            dst,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
     err = []
     for line in proc.stdout:
         line = line.strip()
         k, _, v = line.partition("=")
         if k in ("out_time_us", "out_time_ms"):
             try:  # esos campos van en microsegundos
-                pct = (f"{min(99, int(int(v) / 1e6 * 100 / total))}% "
-                       if total else "")
+                pct = f"{min(99, int(int(v) / 1e6 * 100 / total))}% " if total else ""
             except ValueError:
                 pct = ""
             print(f"\r⟳ convirtiendo… {pct}        ", end="", flush=True)
-        elif k not in ("frame", "fps", "bitrate", "total_size", "progress",
-                       "speed", "drop_frames", "multiframe"):
+        elif k not in (
+            "frame",
+            "fps",
+            "bitrate",
+            "total_size",
+            "progress",
+            "speed",
+            "drop_frames",
+            "multiframe",
+        ):
             if line:
                 err.append(line)
     proc.wait()
@@ -458,10 +580,14 @@ def prepare(media, preset_title=None):
         sys.exit("✖ formato no soportado y ffmpeg no está instalado")
     lame = has_encoder("libmp3lame")
     exts, ctype = (".mp3", "audio/mpeg") if lame else (".m4a", "audio/mp4")
-    enc = (["-c:a", "libmp3lame", "-b:a", "192k"] if lame
-           else ["-c:a", "aac", "-b:a", "192k"])
-    key = hashlib.sha1(f"{src}|{os.path.getsize(src)}|{os.path.getmtime(src):.6f}"
-                       .encode()).hexdigest()[:16]
+    enc = (
+        ["-c:a", "libmp3lame", "-b:a", "192k"]
+        if lame
+        else ["-c:a", "aac", "-b:a", "192k"]
+    )
+    key = hashlib.sha1(
+        f"{src}|{os.path.getsize(src)}|{os.path.getmtime(src):.6f}".encode()
+    ).hexdigest()[:16]
     d = CACHE_DIR
     os.makedirs(d, exist_ok=True)
     cached = os.path.join(d, f"{stem[:60]}.{key}{exts}")
@@ -479,69 +605,110 @@ def prepare(media, preset_title=None):
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
-    def log_message(self, fmt, *args):  # a ~/.cache/cast_audio/serve.log (diagnóstico)
+    def log_message(self, fmt, *args):  # a ~/.cache/cast2nest/serve.log (diagnóstico)
         try:
             os.makedirs(CACHE_DIR, exist_ok=True)
             with open(os.path.join(CACHE_DIR, "serve.log"), "ab") as f:
-                f.write(f"{time.strftime('%d/%m %H:%M:%S')} {self.address_string()} "
-                        f"{fmt % args}\n".encode())
+                f.write(
+                    f"{time.strftime('%d/%m %H:%M:%S')} {self.address_string()} "
+                    f"{fmt % args}\n".encode()
+                )
         except OSError:
             pass
 
     def log_request(self, code="-", size="-"):
-        self.log_message('"%s" %s range=%s', self.requestline, str(code),
-                         self.headers.get("Range") or "-")
+        self.log_message(
+            '"%s" %s range=%s',
+            self.requestline,
+            str(code),
+            self.headers.get("Range") or "-",
+        )
+
+
+class UnsatisfiableRange(ValueError):
+    """El rango solicitado no tiene bytes disponibles."""
 
 
 class RangeFileHandler(QuietHandler):
-    """Archivo con Content-Length + Accept-Ranges + 206 (reintentos/resume del Cast).
+    """Sirve archivos registrados con Range, sin exponer otros archivos.
 
-    Solo sirve las rutas registradas en `routes` (token aleatorio → archivo) y
-    solo al dispositivo Cast (`allowed_ip`): nunca expone el directorio."""
+    GET y HEAD comparten la validación de IP y de ruta. La respuesta HEAD
+    entrega los mismos headers que GET, pero nunca abre ni envía el archivo.
+    """
+
     CHUNK = 1 << 20
-    routes = {}
+    routes: dict[str, str] = {}
     allowed_ip = None
 
     def do_GET(self):
-        if self.allowed_ip and self.client_address[0] != self.allowed_ip:
+        self._serve_file()
+
+    def do_HEAD(self):
+        self._serve_file()
+
+    def _requested_file(self):
+        if self.allowed_ip is None or self.client_address[0] != self.allowed_ip:
             self.send_error(403)
-            return
+            return None
         fpath = self.routes.get(urllib.parse.urlsplit(self.path).path)
         if not fpath or not os.path.isfile(fpath):
             self.send_error(404)
+            return None
+        return fpath
+
+    @staticmethod
+    def _range_bounds(header, size):
+        """Devuelve (inicio, fin), None si no hay un rango simple válido."""
+        m = re.fullmatch(r"bytes=(\d*)-(\d*)", header.strip()) if header else None
+        if not m or not (m.group(1) or m.group(2)):
+            return None
+        first, last = m.groups()
+        if first:
+            start = int(first)
+            if start >= size:
+                raise UnsatisfiableRange
+            end = min(size - 1, int(last)) if last else size - 1
+            if end < start:
+                raise UnsatisfiableRange
+        else:
+            suffix_length = int(last)
+            if suffix_length == 0 or size == 0:
+                raise UnsatisfiableRange
+            start = max(0, size - suffix_length)
+            end = size - 1
+        return start, end
+
+    def _serve_file(self):
+        fpath = self._requested_file()
+        if fpath is None:
             return
         size = os.path.getsize(fpath)
-        start, end = 0, size - 1
-        rng = self.headers.get("Range", "").strip()
-        m = re.match(r"bytes=(\d*)-(\d*)$", rng) if rng else None
-        partial = bool(m) and (m.group(1) or m.group(2))
-        if partial:
-            if m.group(1):
-                start = int(m.group(1))
-                if m.group(2):
-                    end = min(size - 1, int(m.group(2)))
-            else:
-                start = max(0, size - int(m.group(2)))
-            if end < start:  # rango malformado: insatisfacible
-                partial, start, end = False, 0, size - 1
         try:
-            if partial and start >= size:
-                self.send_response(416)
-                self.send_header("Content-Range", f"bytes */{size}")
-                self.end_headers()
-                return
+            bounds = self._range_bounds(self.headers.get("Range", ""), size)
+        except UnsatisfiableRange:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.end_headers()
+            self.close_connection = True
+            return
+
+        partial = bounds is not None
+        start, end = bounds if partial else (0, size - 1)
+        try:
             self.send_response(206 if partial else 200)
             self.send_header("Content-Type", self.guess_type(fpath) or "audio/mpeg")
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Connection", "close")
             if partial:
                 self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Content-Length", str(max(0, end - start + 1)))
             self.end_headers()
+            if self.command == "HEAD":
+                return
             try:
                 with open(fpath, "rb") as f:
                     f.seek(start)
-                    rest = end - start + 1
+                    rest = max(0, end - start + 1)
                     while rest > 0:
                         b = f.read(min(self.CHUNK, rest))
                         if not b:
@@ -549,7 +716,7 @@ class RangeFileHandler(QuietHandler):
                         self.wfile.write(b)
                         rest -= len(b)
             except (BrokenPipeError, ConnectionResetError):
-                pass  # el Cast corta la descarga al terminar/completar buffer: normal
+                pass  # el Cast corta la descarga al completar su buffer: normal
         finally:
             self.close_connection = True
 
@@ -581,9 +748,17 @@ def cast_ip_of(cast_host):
         return None
 
 
+def require_cast_ip(cast_host):
+    """Resuelve el dispositivo o aborta; nunca desactiva el filtro de IP."""
+    cast_ip = cast_ip_of(cast_host)
+    if cast_ip is None:
+        raise ConnectionError(f"no se pudo resolver la IP del Cast: {cast_host}")
+    return cast_ip
+
+
 def serve_files(port, cast_host):
     """Servidor de archivos sueltos; registrar cada uno con `publish`."""
-    cast_ip = cast_ip_of(cast_host)
+    cast_ip = require_cast_ip(cast_host)
     handler = type("Files", (RangeFileHandler,), {"routes": {}, "allowed_ip": cast_ip})
     srv = _serve_on(handler, port)
     srv.routes = handler.routes
@@ -607,6 +782,7 @@ class LiveBuffer:
     """Chunks con número de secuencia: 1 productor, N consumidores en vivo.
     El consumidor avanza y poda los slots que ya pasó; el productor espera
     (backpressure) si hay un consumidor activo y se superó el cap del buffer."""
+
     def __init__(self, cap=16 << 20):
         self.lock = threading.Condition()
         self.slots, self.seq, self.size = [], 0, 0
@@ -641,7 +817,11 @@ class LiveBuffer:
     def stream(self, from_live=False):
         """Generador de chunks; from_live: arranca en la posición actual (reintentos)."""
         with self.lock:
-            nxt = self.seq if from_live else (self.slots[0][0] if self.slots else self.seq)
+            nxt = (
+                self.seq
+                if from_live
+                else (self.slots[0][0] if self.slots else self.seq)
+            )
         while True:
             got = None
             with self.lock:
@@ -671,10 +851,19 @@ def start_stdin_ffmpeg(flags, buf):
             cmd += ["-ar", str(flags["rate"])]
         if flags.get("ch"):
             cmd += ["-ac", str(flags["ch"])]
-    cmd += ["-i", "pipe:0", "-vn", "-f", "mp3", "-c:a", "libmp3lame",
-            "-b:a", "192k", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL)
+    cmd += [
+        "-i",
+        "pipe:0",
+        "-vn",
+        "-f",
+        "mp3",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+        "-",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     def feeder():
         try:
@@ -692,19 +881,32 @@ def start_stdin_ffmpeg(flags, buf):
     return proc
 
 
-def serve_stdin(buf, port, cast_host):
-    """Stream en vivo solo bajo una ruta aleatoria y solo para el Cast."""
+def serve_stdin(buf, port, cast_ip):
+    """Stream en vivo bajo una ruta aleatoria y solo para la IP del Cast."""
     n_get = [0]
-    cast_ip = cast_ip_of(cast_host)
     route = f"/{secrets.token_urlsafe(16)}/stream.mp3"
 
     class StdinHandler(QuietHandler):
-        def do_GET(self):
-            if cast_ip and self.client_address[0] != cast_ip:
+        def _authorized(self):
+            if self.client_address[0] != cast_ip:
                 self.send_error(403)
-                return
+                return False
             if urllib.parse.urlsplit(self.path).path != route:
                 self.send_error(404)
+                return False
+            return True
+
+        def do_HEAD(self):
+            if not self._authorized():
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
+        def do_GET(self):
+            if not self._authorized():
                 return
             n_get[0] += 1
             buf.add_consumer()
@@ -727,11 +929,13 @@ def serve_stdin(buf, port, cast_host):
 
 # ────────────────────────── comandos ──────────────────────────
 
+
 def ensure_app(sess):
     """App de reproducción activa + conexión v2 a su sesión; devuelve la app."""
     st = sess.get_status()
-    app = next((a for a in st.get("applications", [])
-                if a.get("appId") == APP_DEFAULT), None)
+    app = next(
+        (a for a in st.get("applications", []) if a.get("appId") == APP_DEFAULT), None
+    )
     app = app or sess.launch(APP_DEFAULT)
     sess.connect_v2(app["transportId"])
     return app
@@ -741,7 +945,9 @@ def cmd_play(host, port_cast, media_args, port_http, stdin_flags=None):
     tracks = expand_media_args(media_args)
     if any(t["media"] == "-" for t in tracks):
         if len(tracks) > 1:
-            print("ℹ '-' (entrada estándar) va solo como pista única; el resto se ignora")
+            print(
+                "ℹ '-' (entrada estándar) va solo como pista única; el resto se ignora"
+            )
         return cmd_play_stdin(host, port_cast, stdin_flags or {}, port_http)
     total = len(tracks)
     if not total:
@@ -782,15 +988,19 @@ def cmd_play(host, port_cast, media_args, port_http, stdin_flags=None):
         try:  # fin de playlist: cerramos la app y dejamos el altavoz limpio
             app = ensure_app(sess)
             sess.req += 1
-            sess.send(NS_RECV, "receiver-0",
-                      {"type": "STOP", "sessionId": app["sessionId"],
-                       "requestId": sess.req})
+            sess.send(
+                NS_RECV,
+                "receiver-0",
+                {"type": "STOP", "sessionId": app["sessionId"], "requestId": sess.req},
+            )
         except (ConnectionError, ssl.SSLError, OSError, RuntimeError):
             pass
         print(f"🏁 playlist terminada ({ok_tracks}/{total} pistas sonaron)")
     except KeyboardInterrupt:
-        print("\n⏱ interrumpido: el audio sigue en el dispositivo hasta terminar"
-              " (o hasta que alguien lo corte)")
+        print(
+            "\n⏱ interrumpido: el audio sigue en el dispositivo hasta terminar"
+            " (o hasta que alguien lo corte)"
+        )
     finally:
         if srv:
             srv.shutdown()
@@ -800,12 +1010,15 @@ def cmd_play_stdin(host, port_cast, flags, port_http):
     """play -: transmite lo que entra por stdin (transcode en vivo → mp3)."""
     if not shutil.which("ffmpeg"):
         sys.exit("✖ para usar '-' se necesita ffmpeg")
+    cast_ip = require_cast_ip(host)
     buf = LiveBuffer()
     proc = start_stdin_ffmpeg(flags, buf)
-    srv = serve_stdin(buf, port_http, host)
+    srv = serve_stdin(buf, port_http, cast_ip)
     if sys.stdin.isatty():
-        print("⚠ esperando audio por stdin… (si es PCM crudo: "
-              "--in-fmt s16le --in-rate 48000 --in-ch 2)")
+        print(
+            "⚠ esperando audio por stdin… (si es PCM crudo: "
+            "--in-fmt s16le --in-rate 48000 --in-ch 2)"
+        )
     else:
         print("ℹ leyendo entrada estándar → ffmpeg → mp3 en vivo")
     time.sleep(0.5)
@@ -814,8 +1027,10 @@ def cmd_play_stdin(host, port_cast, flags, port_http):
     if proc.poll() is not None and not got_any:
         # ffmpeg salió sin producir nada: entrada no reconocida
         srv.shutdown()
-        sys.exit("✖ ffmpeg no pudo leer la entrada; ¿formato reconocible? "
-                 "para audio crudo: --in-fmt s16le --in-rate 48000 --in-ch 2")
+        sys.exit(
+            "✖ ffmpeg no pudo leer la entrada; ¿formato reconocible? "
+            "para audio crudo: --in-fmt s16le --in-rate 48000 --in-ch 2"
+        )
     try:
         sess = CastSession(host, port_cast)
         app = ensure_app(sess)
@@ -823,10 +1038,13 @@ def cmd_play_stdin(host, port_cast, flags, port_http):
         url = f"http://{local_ip(host)}:{srv.listen_port}{srv.route}"
         print(f"▶ entrada estándar\n   URL: {url}")
         sess.load(app["transportId"], url, "audio/mpeg", "entrada estándar")
-        sess.monitor()
+        if not sess.monitor():
+            sys.exit("✖ la entrada estándar no pudo reproducirse")
     except KeyboardInterrupt:
-        print("\n⏱ interrumpido: el audio sigue en el dispositivo hasta terminar"
-              " (o hasta que alguien lo corte)")
+        print(
+            "\n⏱ interrumpido: el audio sigue en el dispositivo hasta terminar"
+            " (o hasta que alguien lo corte)"
+        )
     finally:
         if proc.poll() is None:
             proc.terminate()
@@ -838,23 +1056,34 @@ def cmd_volume(host, port_cast, level):
     sess = CastSession(host, port_cast)
     if level is None:  # sin argumento: solo consulta
         v = sess.get_status().get("volume", {})
-        print(f"🔊 volumen: {v.get('level', 0) * 100:.0f}%"
-              + ("  ⏺ mute" if v.get("muted") else ""))
+        print(
+            f"🔊 volumen: {v.get('level', 0) * 100:.0f}%"
+            + ("  ⏺ mute" if v.get("muted") else "")
+        )
         return
     lvl = max(0.0, min(1.0, level / 100.0))
     sess.req += 1
     rid = sess.req
-    sess.send(NS_RECV, "receiver-0",
-              {"type": "SET_VOLUME", "volume": {"level": lvl}, "requestId": rid})
+    sess.send(
+        NS_RECV,
+        "receiver-0",
+        {"type": "SET_VOLUME", "volume": {"level": lvl}, "requestId": rid},
+    )
     # el acuse se usa solo para sincronizar; el nivel lo confirmamos con un
     # GET_STATUS fresco porque el estado que viaja asíncrono puede traer el valor anterior
-    sess.wait(lambda m: m["ns"] == NS_RECV
-              and (m["json"] or {}).get("type") in
-              ("SET_VOLUME_REPLY", "RECEIVER_STATUS")
-              and m["json"].get("requestId") == rid, timeout=4)
+    sess.wait(
+        lambda m: (
+            m["ns"] == NS_RECV
+            and (m["json"] or {}).get("type") in ("SET_VOLUME_REPLY", "RECEIVER_STATUS")
+            and m["json"].get("requestId") == rid
+        ),
+        timeout=4,
+    )
     v = sess.get_status().get("volume", {})
-    print(f"🔊 volumen: {v.get('level', lvl) * 100:.0f}%"
-          + ("  ⏺ mute" if v.get("muted") else ""))
+    print(
+        f"🔊 volumen: {v.get('level', lvl) * 100:.0f}%"
+        + ("  ⏺ mute" if v.get("muted") else "")
+    )
 
 
 def cmd_stop(host, port_cast):
@@ -865,11 +1094,18 @@ def cmd_stop(host, port_cast):
         return
     for a in apps:
         sess.req += 1
-        sess.send(NS_RECV, "receiver-0",
-                  {"type": "STOP", "sessionId": a["sessionId"],
-                   "requestId": sess.req})
-    m = sess.wait(lambda m: (m["json"] or {}).get("type") == "RECEIVER_STATUS"
-                  and not m["json"]["status"].get("applications"), timeout=5)
+        sess.send(
+            NS_RECV,
+            "receiver-0",
+            {"type": "STOP", "sessionId": a["sessionId"], "requestId": sess.req},
+        )
+    m = sess.wait(
+        lambda m: (
+            (m["json"] or {}).get("type") == "RECEIVER_STATUS"
+            and not m["json"]["status"].get("applications")
+        ),
+        timeout=5,
+    )
     print("✔ stop" + (" confirmado" if m else " enviado"))
 
 
@@ -883,8 +1119,10 @@ def cmd_status(host, port_cast):
         print("sin apps activas")
         return
     for a in apps:
-        print(f"app: {a.get('displayName', a.get('appId'))}  id:{a.get('appId')}"
-              f"  sesion:{a.get('sessionId')}  transport:{a.get('transportId')}")
+        print(
+            f"app: {a.get('displayName', a.get('appId'))}  id:{a.get('appId')}"
+            f"  sesion:{a.get('sessionId')}  transport:{a.get('transportId')}"
+        )
         if a.get("statusText"):
             print(f"   estado: {a['statusText']}")
 
@@ -895,13 +1133,13 @@ def main():
     except (AttributeError, ValueError):
         pass
     ap = argparse.ArgumentParser(
-        prog="cast_audio.py",
+        prog="cast2nest.py",
         description="Envía audio a un Google Cast (Nest Mini, etc.) usando solo "
-                    "la stdlib de Python (sin pip ni pychromecast). "
-                    "Sin --host, autodescubre el Cast escaneando la subred.",
+        "la stdlib de Python (sin pip ni pychromecast). "
+        "Sin --host, autodescubre el Cast escaneando la subred.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""ejemplos:
-  # una pista (ogg/m4a/etc.: se convierte UNA VEZ a mp3 en ~/.cache/cast_audio;
+  # una pista (ogg/m4a/etc.: se convierte UNA VEZ a mp3 en ~/.cache/cast2nest;
   #            las siguientes veces arranca al instante desde el cache)
   %(prog)s play ~/Música/sonido.mp3
 
@@ -936,18 +1174,25 @@ comportamiento:
   · Ctrl-C: la pista actual sigue en el dispositivo hasta terminar (o `stop`)
   · fin de playlist: se manda STOP y el altavoz queda libre
   · una pista rechazada por el firmware: se saltea y sigue con la próxima
-  · diagnósticos HTTP (con Range) en ~/.cache/cast_audio/serve.log
-""")
+  · diagnósticos HTTP (con Range) en ~/.cache/cast2nest/serve.log
+""",
+    )
     ap.add_argument("--host", help="IP del dispositivo Cast (si no: autodescubre)")
     ap.add_argument("--cast-port", type=int, default=8009)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("play", help="reproduce 1+ archivo/URL, un directorio "
-                                    "o una playlist .m3u/.m3u8; '-' pipa stdin")
+    p = sub.add_parser(
+        "play",
+        help="reproduce 1+ archivo/URL, un directorio "
+        "o una playlist .m3u/.m3u8; '-' pipa stdin",
+    )
     p.add_argument("media", nargs="+")
     p.add_argument("--http-port", type=int, default=8099)
-    p.add_argument("--raw", action="store_true",
-                   help="'-': entrada cruda PCM con default s16le·48000·2 canales "
-                        "(ajustable a mano con --in-rate/--in-ch)")
+    p.add_argument(
+        "--raw",
+        action="store_true",
+        help="'-': entrada cruda PCM con default s16le·48000·2 canales "
+        "(ajustable a mano con --in-rate/--in-ch)",
+    )
     p.add_argument("--in-fmt", help="'-': formato crudo fino (ej. s16le, f32le)")
     p.add_argument("--in-rate", type=int, help="'-': sample rate fino (ej. 44100)")
     p.add_argument("--in-ch", type=int, help="'-': canales finos (ej. 2)")
@@ -958,7 +1203,7 @@ comportamiento:
     args = ap.parse_args()
 
     host = args.host or pick_host()
-    print(f"→ Cast: {host}:8009")
+    print(f"→ Cast: {host}:{args.cast_port}")
     if args.cmd == "play":
         fmt = args.in_fmt or ("s16le" if args.raw else None)
         flags = {}
