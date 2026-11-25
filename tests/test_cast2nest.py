@@ -133,6 +133,83 @@ class MediaTests(unittest.TestCase):
         self.assertIn("usage: cast2nest.py", result.stdout)
         self.assertNotIn("cast_audio.py", result.stdout)
 
+    def test_ordered_tracks_keeps_the_original_order_without_shuffle(self):
+        tracks = [{"media": "a"}, {"media": "b"}, {"media": "c"}]
+        order = cast2nest.ordered_tracks(tracks, shuffle=False)
+        self.assertEqual([t["media"] for t in order], ["a", "b", "c"])
+
+    def test_shuffle_changes_the_order_and_keeps_every_track(self):
+        tracks = [{"media": str(i)} for i in range(20)]
+        with patch.object(cast2nest.random, "shuffle", side_effect=list.reverse):
+            order = cast2nest.ordered_tracks(tracks, shuffle=True)
+        self.assertEqual(
+            sorted(t["media"] for t in order), sorted(t["media"] for t in tracks)
+        )
+        self.assertNotEqual([t["media"] for t in order], [t["media"] for t in tracks])
+
+    def test_shuffle_returns_a_new_list(self):
+        tracks = [{"media": "a"}, {"media": "b"}]
+        order = cast2nest.ordered_tracks(tracks, shuffle=True)
+        self.assertIsNot(order, tracks)
+
+    def test_repeat_plays_the_playlist_again(self):
+        session = Mock()
+        session.monitor.side_effect = ["finished", "finished", KeyboardInterrupt]
+        app = {"transportId": "transport"}
+        with (
+            patch.object(cast2nest, "CastSession", return_value=session),
+            patch.object(cast2nest, "ensure_app", return_value=app),
+            patch.object(cast2nest, "watch_next_key", return_value=lambda: None),
+            patch.object(
+                cast2nest,
+                "expand_media_args",
+                return_value=[
+                    {"media": "http://a/1.mp3", "title": None},
+                    {"media": "http://a/2.mp3", "title": None},
+                ],
+            ),
+            patch.object(
+                cast2nest,
+                "prepare",
+                return_value=("url", "http://a/x.mp3", "audio/mpeg", "x"),
+            ),
+            patch.object(cast2nest, "media_title", return_value="x"),
+            patch.object(cast2nest, "close_app"),
+            patch("builtins.print"),
+        ):
+            cast2nest.cmd_play(
+                "cast.local", 8009, ["a.mp3", "b.mp3"], 8099, repeat=True
+            )
+        self.assertEqual(session.monitor.call_count, 3)
+
+    def test_no_repeat_stops_after_one_pass(self):
+        session = Mock()
+        session.monitor.side_effect = ["finished", "finished"]
+        app = {"transportId": "transport"}
+        with (
+            patch.object(cast2nest, "CastSession", return_value=session),
+            patch.object(cast2nest, "ensure_app", return_value=app),
+            patch.object(cast2nest, "watch_next_key", return_value=lambda: None),
+            patch.object(
+                cast2nest,
+                "expand_media_args",
+                return_value=[
+                    {"media": "http://a/1.mp3", "title": None},
+                    {"media": "http://a/2.mp3", "title": None},
+                ],
+            ),
+            patch.object(
+                cast2nest,
+                "prepare",
+                return_value=("url", "http://a/x.mp3", "audio/mpeg", "x"),
+            ),
+            patch.object(cast2nest, "media_title", return_value="x"),
+            patch.object(cast2nest, "close_app") as close,
+        ):
+            cast2nest.cmd_play("cast.local", 8009, ["a.mp3", "b.mp3"], 8099)
+        self.assertEqual(session.monitor.call_count, 2)
+        close.assert_called_once()
+
     def test_cli_version_prints_the_version(self):
         result = subprocess.run(
             [sys.executable, str(ROOT / "cast2nest.py"), "--version"],

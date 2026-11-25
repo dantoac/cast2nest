@@ -11,6 +11,9 @@ functionality available in each release.
   terminal running `play`.
 - The new `next` command to skip to the next track from another terminal.
 - `--version` prints the running version.
+- `--shuffle` plays the tracks in a shuffled order and prints the order.
+- `--repeat` plays the playlist again when it ends, until `Ctrl-C` or `stop`.
+  Combined with `--shuffle`, each pass is reshuffled and printed again.
 
 ### Fixes
 
@@ -18,6 +21,8 @@ functionality available in each release.
   status messages from the previous media session.
 - `next` works from other terminals and machines: the command now connects
   to the media transport before commanding the device.
+- Example device addresses are now documentation IPs (192.0.2.10) instead of
+  real LAN addresses.
 
 ## [0.1.0] - 2026-11-11
 

@@ -37,6 +37,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import select
@@ -1180,7 +1181,24 @@ def close_app(sess):
         pass
 
 
-def cmd_play(host, port_cast, media_args, port_http, stdin_flags=None):
+def ordered_tracks(tracks, shuffle):
+    """Order for one pass through the playlist; shuffled when requested."""
+    if not shuffle:
+        return list(tracks)
+    shuffled = list(tracks)
+    random.shuffle(shuffled)
+    return shuffled
+
+
+def cmd_play(
+    host,
+    port_cast,
+    media_args,
+    port_http,
+    stdin_flags=None,
+    shuffle=False,
+    repeat=False,
+):
     tracks = expand_media_args(media_args)
     if any(t["media"] == "-" for t in tracks):
         if len(tracks) > 1:
@@ -1192,6 +1210,8 @@ def cmd_play(host, port_cast, media_args, port_http, stdin_flags=None):
     if not total:
         sys.exit("error: no tracks to play")
     print(f"playlist: {total} track{'s' if total > 1 else ''}")
+    if repeat:
+        print("repeat: on (until Ctrl-C or `stop`)")
     next_requests = NextRequests()
     restore_terminal = watch_next_key(next_requests)
     print(
@@ -1202,46 +1222,58 @@ def cmd_play(host, port_cast, media_args, port_http, stdin_flags=None):
     ok_tracks = 0
     app_closed = False
     prev_session = None
+    pass_number = 1
     try:
         sess = CastSession(host, port_cast)
         app = ensure_app(sess)
         print(f"active app: {app.get('displayName', 'Default Media Receiver')}")
-        for i, tr in enumerate(tracks, 1):
-            media = tr["media"]
-            try:
-                kind, payload, ctype, title = prepare(media, tr["title"])
-            except SystemExit:
-                print(f"note: track [{i}/{total}] is inaccessible: {media}")
-                continue
-            if kind == "url":
-                url = payload
-            elif kind == "file":
-                d, fn = payload
-                if srv is None:
-                    srv = serve_files(port_http, host)
-                route = publish(srv, os.path.join(d, fn))
-                url = f"http://{local_ip(host)}:{srv.listen_port}{route}"
-            app = ensure_app(sess)
-            print(f"\n[{i}/{total}] {title}")
-            print(f"   URL: {url}")
-            sess.load(app["transportId"], url, ctype, title)
-            outcome = sess.monitor(
-                app["transportId"], next_requests, ignore_session_id=prev_session
+        while True:
+            order = ordered_tracks(tracks, shuffle)
+            print(
+                f"pass {pass_number}: "
+                + " -> ".join(media_title(t["media"], t["title"]) for t in order)
             )
-            prev_session = sess.last_media_session_id or prev_session
-            if outcome in ("finished", "skipped"):
-                ok_tracks += 1
-            elif outcome == "stopped":
-                app_closed = True
+            pass_number += 1
+            for i, tr in enumerate(order, 1):
+                media = tr["media"]
+                try:
+                    kind, payload, ctype, title = prepare(media, tr["title"])
+                except SystemExit:
+                    print(f"note: track [{i}/{total}] is inaccessible: {media}")
+                    continue
+                if kind == "url":
+                    url = payload
+                elif kind == "file":
+                    d, fn = payload
+                    if srv is None:
+                        srv = serve_files(port_http, host)
+                    route = publish(srv, os.path.join(d, fn))
+                    url = f"http://{local_ip(host)}:{srv.listen_port}{route}"
+                app = ensure_app(sess)
+                print(f"\n[{i}/{total}] {title}")
+                print(f"   URL: {url}")
+                sess.load(app["transportId"], url, ctype, title)
+                outcome = sess.monitor(
+                    app["transportId"], next_requests, ignore_session_id=prev_session
+                )
+                prev_session = sess.last_media_session_id or prev_session
+                if outcome in ("finished", "skipped"):
+                    ok_tracks += 1
+                elif outcome == "stopped":
+                    app_closed = True
+                    break
+                else:
+                    print(f"note: skipping track [{i}/{total}]")
+            if app_closed:
                 break
-            else:
-                print(f"note: skipping track [{i}/{total}]")
+            if not repeat:
+                break
         if not ok_tracks and not app_closed:
             print("error: no tracks could be played")
             sys.exit(1)
         if not app_closed:
             close_app(sess)  # end of playlist: leave the speaker idle
-        print(f"playlist finished ({ok_tracks}/{total} tracks played)")
+        print(f"playlist finished ({ok_tracks} tracks played)")
     except KeyboardInterrupt:
         print(
             "\ninterrupted: audio continues on the device until it finishes"
@@ -1427,6 +1459,10 @@ def main():
   %(prog)s play ~/Music/*.mp3 https://a.radio/stream.mp3
   %(prog)s play ~/Music/coding.m3u
 
+  # shuffle once per pass, and repeat the playlist until Ctrl-C or `stop`
+  %(prog)s play ~/Music/ --shuffle
+  %(prog)s play ~/Music/coding.m3u --repeat
+
   # pipe from another app (ffmpeg detects mp3/ogg/flac/webm... automatically)
   yt-dlp -o - "URL" | %(prog)s play -
   cat file.ogg | %(prog)s play -
@@ -1444,11 +1480,13 @@ device control:
   %(prog)s volume 40     # set volume to 0..100
   %(prog)s stop          # stop playback
   %(prog)s status        # volume + active app
-  %(prog)s --host 192.168.1.138 play ...   # skip discovery
+  %(prog)s --host 192.0.2.10 play ...   # skip discovery
 
 behavior:
   - during playback: Enter or 'n' on this terminal, or `next` from another one,
     goes to the next track
+  - --shuffle: prints the shuffled order at the start of each pass
+  - --repeat: plays the playlist again after it ends, until Ctrl-C or `stop`
   - during playback, the process stays alive to serve file(s) over HTTP (:8099)
   - Ctrl-C: the current track continues on the device until it finishes (or `stop`)
   - end of playlist: sends STOP and releases the speaker
@@ -1467,6 +1505,16 @@ behavior:
     )
     p.add_argument("media", nargs="+")
     p.add_argument("--http-port", type=int, default=8099)
+    p.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="shuffle the track order (reshuffled and printed on each pass)",
+    )
+    p.add_argument(
+        "--repeat",
+        action="store_true",
+        help="repeat the playlist after it ends, until Ctrl-C or `stop`",
+    )
     p.add_argument(
         "--raw",
         action="store_true",
@@ -1492,7 +1540,15 @@ behavior:
             flags["fmt"] = fmt
             flags["rate"] = args.in_rate or (48000 if args.raw else None)
             flags["ch"] = args.in_ch or (2 if args.raw else None)
-        cmd_play(host, args.cast_port, args.media, args.http_port, flags)
+        cmd_play(
+            host,
+            args.cast_port,
+            args.media,
+            args.http_port,
+            flags,
+            shuffle=args.shuffle,
+            repeat=args.repeat,
+        )
     elif args.cmd == "next":
         cmd_next(host, args.cast_port)
     elif args.cmd == "volume":

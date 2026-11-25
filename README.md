@@ -12,7 +12,8 @@ trusted Wi-Fi network or LAN.
 
 - Plays MP3, FLAC, and WAV files without converting them.
 - Converts other audio formats and saves a cached copy.
-- Plays directories, M3U/M3U8 playlists, URLs, and standard input.
+- Plays directories, M3U/M3U8 playlists, URLs, and standard input, with
+  optional shuffle and repeat.
 - Lets you skip to the next track, check and change the volume, view
   status, and stop playback.
 - Reports its version with `--version`.
@@ -81,7 +82,12 @@ The process must stay open while the speaker plays local files. If HTTP port
 ./cast2nest.py play first.mp3 second.flac
 ./cast2nest.py play ~/Music/focus/
 ./cast2nest.py play ~/Music/focus.m3u8
+./cast2nest.py play ~/Music/album --shuffle   # shuffled order, printed
+./cast2nest.py play ~/Music/coding.m3u --repeat  # repeat until Ctrl-C
 ```
+
+Both options can be combined. With `--shuffle`, each pass of `--repeat` is
+reshuffled and printed again.
 
 A directory is played in alphabetical order. You can also set a custom title
 for a track:
@@ -136,7 +142,7 @@ Without `--host`, the program scans TCP port 8009 on the local `/24` subnet.
 To skip discovery:
 
 ```sh
-./cast2nest.py --host 192.168.1.50 status
+./cast2nest.py --host 192.0.2.10 status
 ```
 
 The default Cast port is 8009. It can be changed with `--cast-port`.
@@ -149,6 +155,8 @@ The default Cast port is 8009. It can be changed with `--cast-port`.
 - Skipping a track advances the playlist. Skipping the last track leaves the
   speaker idle, as when the playlist finishes. `stop` still stops the playback
   application.
+- With `--repeat`, the playlist keeps playing until you press `Ctrl-C` or run
+  `stop`. With `--shuffle`, the order is reshuffled and printed on each pass.
 - Conversions are saved in `~/.cache/cast2nest`.
 - HTTP diagnostics, including file names and served paths, are saved in
   `~/.cache/cast2nest/serve.log`.
@@ -187,7 +195,7 @@ ruff format --check .
 mypy --ignore-missing-imports cast2nest.py
 ```
 
-CI runs 42 tests on Python 3.10, 3.12, and 3.13, plus Ruff and mypy.
+CI runs 47 tests on Python 3.10, 3.12, and 3.13, plus Ruff and mypy.
 
 ## Creating a release
 
