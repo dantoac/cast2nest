@@ -1313,6 +1313,7 @@ def cmd_next(host, port_cast):
         reason = "nothing is playing" if not apps else "cast2nest is not playing"
         print(f"note: {reason}")
         return
+    sess.connect_v2(app["transportId"])
     media = sess.media_status(app["transportId"])
     if not media:
         print("note: nothing is playing")

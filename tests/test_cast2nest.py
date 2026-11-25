@@ -519,9 +519,12 @@ class NextCommandTests(unittest.TestCase):
         session.wait_media_status.return_value = {"json": {}}
         with patch.object(cast2nest, "CastSession", return_value=session):
             cast2nest.cmd_next("cast.local", 8009)
+        session.connect_v2.assert_called_once_with("transport")
         session.send_media.assert_called_once_with(
             "transport", {"type": "STOP", "mediaSessionId": 7}
         )
+        commands = [entry[0] for entry in session.mock_calls]
+        self.assertLess(commands.index("connect_v2"), commands.index("media_status"))
 
     def test_next_without_playback_sends_nothing(self):
         session = Mock()
