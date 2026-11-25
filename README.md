@@ -15,6 +15,7 @@ trusted Wi-Fi network or LAN.
 - Plays directories, M3U/M3U8 playlists, URLs, and standard input.
 - Lets you skip to the next track, check and change the volume, view
   status, and stop playback.
+- Reports its version with `--version`.
 - Automatically discovers Cast devices on the local subnet.
 
 ## How it works
@@ -186,7 +187,7 @@ ruff format --check .
 mypy --ignore-missing-imports cast2nest.py
 ```
 
-CI runs 26 tests on Python 3.10, 3.12, and 3.13, plus Ruff and mypy.
+CI runs 42 tests on Python 3.10, 3.12, and 3.13, plus Ruff and mypy.
 
 ## Creating a release
 

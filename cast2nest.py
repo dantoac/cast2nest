@@ -58,6 +58,8 @@ NS_HB = "urn:x-cast:com.google.cast.tp.heartbeat"
 NS_AUTH = "urn:x-cast:com.google.cast.tp.deviceauth"
 NS_RECV = "urn:x-cast:com.google.cast.receiver"
 NS_MEDIA = "urn:x-cast:com.google.cast.media"
+__version__ = "0.2.0"
+
 APP_DEFAULT = "CC1AD845"  # Default Media Receiver
 # Only formats that ALL Cast devices can reliably decode are copied unchanged;
 # all others (ogg, m4a, opus, etc.) are converted ONCE to mp3 with ffmpeg and
@@ -1456,6 +1458,7 @@ behavior:
     )
     ap.add_argument("--host", help="Cast device IP (otherwise: discover automatically)")
     ap.add_argument("--cast-port", type=int, default=8009)
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser(
         "play",

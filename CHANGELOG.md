@@ -3,13 +3,21 @@
 All versions use Semantic Versioning. This file documents only the
 functionality available in each release.
 
-## [Unreleased]
+## [0.2.0] - 2026-11-25
 
 ### Features
 
 - Skipping to the next track during playback with Enter or `n` in the
   terminal running `play`.
 - The new `next` command to skip to the next track from another terminal.
+- `--version` prints the running version.
+
+### Fixes
+
+- The playlist no longer skips every track: the monitor ignores leftover
+  status messages from the previous media session.
+- `next` works from other terminals and machines: the command now connects
+  to the media transport before commanding the device.
 
 ## [0.1.0] - 2026-11-11
 

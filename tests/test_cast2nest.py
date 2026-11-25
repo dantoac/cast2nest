@@ -133,6 +133,16 @@ class MediaTests(unittest.TestCase):
         self.assertIn("usage: cast2nest.py", result.stdout)
         self.assertNotIn("cast_audio.py", result.stdout)
 
+    def test_cli_version_prints_the_version(self):
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "cast2nest.py"), "--version"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn(cast2nest.__version__, result.stdout)
+        self.assertRegex(result.stdout.strip(), r"^cast2nest\.py \d+\.\d+\.\d+")
+
     def test_cli_help_is_in_english(self):
         result = subprocess.run(
             [sys.executable, str(ROOT / "cast2nest.py"), "--help"],
