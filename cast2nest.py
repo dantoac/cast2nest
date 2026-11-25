@@ -321,8 +321,14 @@ class CastSession:
         statuses = ((m or {}).get("json") or {}).get("status") or []
         return statuses[0] if statuses else None
 
-    def monitor(self, transport_id, next_requests):
+    def monitor(self, transport_id, next_requests, ignore_session_id=None):
         """Watch the loaded track until it ends.
+
+        `ignore_session_id` is the media session of the previous track; its
+        leftover status messages (the receiver may still report it as
+        interrupted by our LOAD) are ignored. Sets `self.last_media_session_id`
+        to the session this monitor actually watched, so the caller can pass it
+        as `ignore_session_id` for the next track.
 
         Returns "finished", "skipped", "stopped" or "failed": a track is
         "skipped" when it is abandoned to move on to the next one (Enter or
@@ -330,8 +336,10 @@ class CastSession:
         same STOP), and "stopped" when the playback app is gone.
         """
         next_requests.forget()  # a request from before this track does not count
+        self.last_media_session_id = None
         played, skip_sent, seen_media = False, False, False
-        session_id, skip_deadline, last, last_ping = None, 0.0, None, 0.0
+        tracked = None
+        skip_deadline, last, last_ping = 0.0, None, 0.0
         result = "failed"
         while True:
             now = time.time()
@@ -344,12 +352,12 @@ class CastSession:
             if skip_sent and now > skip_deadline:
                 result = "skipped"  # the device never confirmed the STOP
                 break
-            if not skip_sent and session_id is not None and next_requests.take():
+            if not skip_sent and tracked is not None and next_requests.take():
                 skip_sent, skip_deadline = True, now + 6
                 print("skipping to the next track")
                 try:
                     self.send_media(
-                        transport_id, {"type": "STOP", "mediaSessionId": session_id}
+                        transport_id, {"type": "STOP", "mediaSessionId": tracked}
                     )
                 except (ConnectionError, ssl.SSLError, OSError):
                     result = "skipped"
@@ -390,19 +398,51 @@ class CastSession:
                 payload = m["json"] or {}
                 msg_type = payload.get("type")
                 if msg_type in ("LOAD_FAILED", "LOAD_CANCELLED", "ERROR"):
+                    foreign = (
+                        tracked is not None
+                        and payload.get("mediaSessionId") is not None
+                        and payload.get("mediaSessionId") != tracked
+                    )
+                    if foreign:
+                        continue  # error for a session that is not this track
                     print(f"error: the device rejected the track ({msg_type})")
                     break
                 if msg_type != "MEDIA_STATUS":
                     continue
                 statuses = payload.get("status") or []
-                if not statuses:  # a STOP invalidated the session: next track
-                    if seen_media or skip_sent:
-                        result = "skipped"
-                        break
-                    continue
+                if tracked is not None:
+                    mine = [
+                        s
+                        for s in statuses
+                        if s.get("mediaSessionId") in (None, tracked)
+                    ]
+                    if not mine:
+                        if statuses:
+                            continue  # leftover status of another track
+                        if seen_media or skip_sent:
+                            result = "skipped"  # our session was stopped
+                            break
+                        continue
+                    statuses = mine
+                else:
+                    statuses = [
+                        s
+                        for s in statuses
+                        if s.get("mediaSessionId") != ignore_session_id
+                    ]
+                    if not statuses:
+                        continue  # leftover status of the previous track
+                    tracked = next(
+                        (
+                            s.get("mediaSessionId")
+                            for s in statuses
+                            if s.get("mediaSessionId") is not None
+                        ),
+                        None,
+                    )
+                    self.last_media_session_id = tracked
                 seen_media = True
                 s0 = statuses[0]
-                session_id = s0.get("mediaSessionId") or session_id
                 ps = s0.get("playerState") or "IDLE"
                 if ps != last:
                     print(f"state: {ps}")
@@ -1159,6 +1199,7 @@ def cmd_play(host, port_cast, media_args, port_http, stdin_flags=None):
     srv = None
     ok_tracks = 0
     app_closed = False
+    prev_session = None
     try:
         sess = CastSession(host, port_cast)
         app = ensure_app(sess)
@@ -1182,7 +1223,10 @@ def cmd_play(host, port_cast, media_args, port_http, stdin_flags=None):
             print(f"\n[{i}/{total}] {title}")
             print(f"   URL: {url}")
             sess.load(app["transportId"], url, ctype, title)
-            outcome = sess.monitor(app["transportId"], next_requests)
+            outcome = sess.monitor(
+                app["transportId"], next_requests, ignore_session_id=prev_session
+            )
+            prev_session = sess.last_media_session_id or prev_session
             if outcome in ("finished", "skipped"):
                 ok_tracks += 1
             elif outcome == "stopped":

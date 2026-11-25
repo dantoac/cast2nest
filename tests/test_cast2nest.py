@@ -48,7 +48,7 @@ def request(handler_cls, method, path, source_ip=OTHER_IP, headers=None):
     return status, response_headers, body
 
 
-def monitor(messages, requests=None, on_recv=None, sent=None):
+def monitor(messages, requests=None, on_recv=None, sent=None, ignore_session_id=None):
     """Run CastSession.monitor over `messages`.
 
     `on_recv` runs as each message arrives, to press the key during the
@@ -76,11 +76,15 @@ def monitor(messages, requests=None, on_recv=None, sent=None):
     with patch.object(
         cast2nest.select, "select", return_value=([session.sock], [], [])
     ):
-        return session.monitor("transport", requests or cast2nest.NextRequests())
+        return session.monitor(
+            "transport",
+            requests or cast2nest.NextRequests(),
+            ignore_session_id=ignore_session_id,
+        )
 
 
-def media_status(player_state, idle_reason=None):
-    status = {"mediaSessionId": 7, "playerState": player_state}
+def media_status(player_state, idle_reason=None, session_id=7):
+    status = {"mediaSessionId": session_id, "playerState": player_state}
     if idle_reason:
         status["idleReason"] = idle_reason
     return {
@@ -414,6 +418,53 @@ class PlaybackTests(unittest.TestCase):
             ]
         )
         self.assertEqual(result, "skipped")
+
+    def test_stale_interrupted_for_the_previous_session_is_ignored(self):
+        result = monitor(
+            [
+                {
+                    "ns": cast2nest.NS_MEDIA,
+                    "json": {
+                        "type": "MEDIA_STATUS",
+                        "status": [
+                            {
+                                "mediaSessionId": 7,
+                                "playerState": "IDLE",
+                                "idleReason": "INTERRUPTED",
+                            }
+                        ],
+                    },
+                },
+                media_status("PLAYING", session_id=8),
+                media_status("IDLE", "FINISHED", session_id=8),
+            ],
+            ignore_session_id=7,
+        )
+        self.assertEqual(result, "finished")
+
+    def test_a_different_session_is_ignored_before_ours_starts(self):
+        stale = {
+            "ns": cast2nest.NS_MEDIA,
+            "json": {
+                "type": "MEDIA_STATUS",
+                "status": [
+                    {
+                        "mediaSessionId": 7,
+                        "playerState": "IDLE",
+                        "idleReason": "FINISHED",
+                    }
+                ],
+            },
+        }
+        result = monitor(
+            [
+                stale,
+                media_status("PLAYING", session_id=8),
+                media_status("IDLE", "FINISHED", session_id=8),
+            ],
+            ignore_session_id=7,
+        )
+        self.assertEqual(result, "finished")
 
     def test_the_playback_app_closing_stops_the_playlist(self):
         result = monitor(
