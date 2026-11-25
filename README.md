@@ -209,8 +209,9 @@ git push origin v0.2.0
 ```
 
 The tag runs tests and static checks. If all pass, CI creates the GitHub Release
-with automatically generated notes. Tags with a suffix such as `v0.2.0-rc.1`
-are published as prereleases.
+with automatically generated notes and attaches `cast2nest.py` itself as a
+downloadable asset (the single executable script). Tags with a suffix such as
+`v0.2.0-rc.1` are published as prereleases.
 
 ## License
 
