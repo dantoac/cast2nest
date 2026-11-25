@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from itertools import islice
@@ -47,29 +48,39 @@ def request(handler_cls, method, path, source_ip=OTHER_IP, headers=None):
     return status, response_headers, body
 
 
-def monitor(messages):
+def monitor(messages, requests=None, on_recv=None, sent=None):
+    """Run CastSession.monitor over `messages`.
+
+    `on_recv` runs as each message arrives, to press the key during the
+    track; `sent` collects the messages the session sends.
+    """
     session = cast2nest.CastSession.__new__(cast2nest.CastSession)
     session.sock = object()
-    session.send = lambda *args: None
+    session.req = 0
+    outgoing = sent if sent is not None else []
+    session.send = lambda ns, dst, obj: outgoing.append((ns, dst, obj))
     incoming = iter(messages)
 
     def recv_msg(**kwargs):
         try:
-            return next(incoming)
+            message = next(incoming)
         except StopIteration as exc:
             raise AssertionError(
                 "monitor did not stop after the final message"
             ) from exc
+        if on_recv:
+            on_recv()
+        return message
 
     session.recv_msg = recv_msg
     with patch.object(
         cast2nest.select, "select", return_value=([session.sock], [], [])
     ):
-        return session.monitor()
+        return session.monitor("transport", requests or cast2nest.NextRequests())
 
 
 def media_status(player_state, idle_reason=None):
-    status = {"playerState": player_state}
+    status = {"mediaSessionId": 7, "playerState": player_state}
     if idle_reason:
         status["idleReason"] = idle_reason
     return {
@@ -294,18 +305,127 @@ class LiveBufferTests(unittest.TestCase):
         buffer.drop_consumer(slow)
 
 
+class NextRequestsTests(unittest.TestCase):
+    def test_take_without_a_press_returns_false(self):
+        self.assertFalse(cast2nest.NextRequests().take())
+
+    def test_a_second_press_does_not_queue_a_second_skip(self):
+        requests = cast2nest.NextRequests()
+        requests.press()
+        requests.press()
+        self.assertTrue(requests.take())
+        self.assertFalse(requests.take())
+
+    def test_forget_drops_the_pending_request(self):
+        requests = cast2nest.NextRequests()
+        requests.press()
+        requests.forget()
+        self.assertFalse(requests.take())
+
+
+class NextKeyTests(unittest.TestCase):
+    def test_enter_and_n_request_the_next_track(self):
+        requests = cast2nest.NextRequests()
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        stdin = Mock()
+        stdin.isatty.return_value = True
+        stdin.fileno.return_value = read_fd
+        with patch.object(cast2nest.sys, "stdin", stdin):
+            close = cast2nest.watch_next_key(requests)
+        self.addCleanup(close)
+        for key in (b"n", b"N", b"\r", b"\n"):
+            os.write(write_fd, key)
+            for _ in range(100):
+                if requests.take():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail(f"{key!r} did not request the next track")
+
+    def test_the_watcher_returns_a_close_callable_without_a_terminal(self):
+        with patch.object(cast2nest.sys.stdin, "isatty", return_value=False):
+            close = cast2nest.watch_next_key(cast2nest.NextRequests())
+        self.assertTrue(callable(close))
+
+
 class PlaybackTests(unittest.TestCase):
     def test_buffering_then_error_is_a_failure(self):
         result = monitor([media_status("BUFFERING"), media_status("IDLE", "ERROR")])
-        self.assertFalse(result)
+        self.assertEqual(result, "failed")
 
     def test_playing_then_finished_is_a_success(self):
         result = monitor([media_status("PLAYING"), media_status("IDLE", "FINISHED")])
-        self.assertTrue(result)
+        self.assertEqual(result, "finished")
 
     def test_load_failed_stops_monitoring(self):
         result = monitor([{"ns": cast2nest.NS_MEDIA, "json": {"type": "LOAD_FAILED"}}])
-        self.assertFalse(result)
+        self.assertEqual(result, "failed")
+
+    def test_playing_then_cancelled_is_a_skip(self):
+        result = monitor([media_status("PLAYING"), media_status("IDLE", "CANCELLED")])
+        self.assertEqual(result, "skipped")
+
+    def test_a_key_press_skips_the_current_track(self):
+        requests = cast2nest.NextRequests()
+        result = monitor(
+            [media_status("PLAYING"), media_status("IDLE", "CANCELLED")],
+            requests=requests,
+            on_recv=requests.press,
+        )
+        self.assertEqual(result, "skipped")
+
+    def test_the_key_press_stops_the_media_session_on_the_device(self):
+        requests = cast2nest.NextRequests()
+        sent = []
+        monitor(
+            [media_status("PLAYING"), media_status("IDLE", "CANCELLED")],
+            requests=requests,
+            on_recv=requests.press,
+            sent=sent,
+        )
+        self.assertIn(
+            (
+                cast2nest.NS_MEDIA,
+                "transport",
+                {"type": "STOP", "mediaSessionId": 7, "requestId": 1},
+            ),
+            sent,
+        )
+
+    def test_a_press_before_the_track_is_ignored(self):
+        requests = cast2nest.NextRequests()
+        requests.press()
+        result = monitor(
+            [media_status("PLAYING"), media_status("IDLE", "FINISHED")],
+            requests=requests,
+        )
+        self.assertEqual(result, "finished")
+
+    def test_a_removed_media_session_is_a_skip(self):
+        result = monitor(
+            [
+                media_status("PLAYING"),
+                {
+                    "ns": cast2nest.NS_MEDIA,
+                    "json": {"type": "MEDIA_STATUS", "status": []},
+                },
+            ]
+        )
+        self.assertEqual(result, "skipped")
+
+    def test_the_playback_app_closing_stops_the_playlist(self):
+        result = monitor(
+            [
+                media_status("PLAYING"),
+                {
+                    "ns": cast2nest.NS_RECV,
+                    "json": {"type": "RECEIVER_STATUS", "status": {"applications": []}},
+                },
+            ]
+        )
+        self.assertEqual(result, "stopped")
 
     def test_stdin_monitor_failure_returns_an_error(self):
         buffer = cast2nest.LiveBuffer()
@@ -316,7 +436,7 @@ class PlaybackTests(unittest.TestCase):
         server.listen_port = 8099
         server.route = "/random/stream.mp3"
         session = Mock()
-        session.monitor.return_value = False
+        session.monitor.return_value = "failed"
         app = {"transportId": "transport"}
 
         with (
@@ -333,6 +453,31 @@ class PlaybackTests(unittest.TestCase):
         ):
             cast2nest.cmd_play_stdin("cast.local", 8009, {}, 8099)
         self.assertNotIn(raised.exception.code, (None, 0))
+
+
+class NextCommandTests(unittest.TestCase):
+    def test_next_stops_the_current_media_session(self):
+        session = Mock()
+        session.get_status.return_value = {
+            "applications": [
+                {"appId": cast2nest.APP_DEFAULT, "transportId": "transport"}
+            ]
+        }
+        session.media_status.return_value = {"mediaSessionId": 7}
+        session.send_media.return_value = 1
+        session.wait_media_status.return_value = {"json": {}}
+        with patch.object(cast2nest, "CastSession", return_value=session):
+            cast2nest.cmd_next("cast.local", 8009)
+        session.send_media.assert_called_once_with(
+            "transport", {"type": "STOP", "mediaSessionId": 7}
+        )
+
+    def test_next_without_playback_sends_nothing(self):
+        session = Mock()
+        session.get_status.return_value = {"applications": []}
+        with patch.object(cast2nest, "CastSession", return_value=session):
+            cast2nest.cmd_next("cast.local", 8009)
+        session.send_media.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -3,6 +3,14 @@
 All versions use Semantic Versioning. This file documents only the
 functionality available in each release.
 
+## [Unreleased]
+
+### Features
+
+- Skipping to the next track during playback with Enter or `n` in the
+  terminal running `play`.
+- The new `next` command to skip to the next track from another terminal.
+
 ## [0.1.0] - 2026-11-11
 
 ### Features

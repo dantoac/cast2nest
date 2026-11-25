@@ -13,7 +13,8 @@ trusted Wi-Fi network or LAN.
 - Plays MP3, FLAC, and WAV files without converting them.
 - Converts other audio formats and saves a cached copy.
 - Plays directories, M3U/M3U8 playlists, URLs, and standard input.
-- Lets you check and change the volume, view status, and stop playback.
+- Lets you skip to the next track, check and change the volume, view
+  status, and stop playback.
 - Automatically discovers Cast devices on the local subnet.
 
 ## How it works
@@ -115,11 +116,18 @@ The defaults are signed 16-bit little-endian PCM, 48000 Hz, and stereo. Use
 ### Control the speaker
 
 ```sh
+./cast2nest.py next         # skip to the next track
 ./cast2nest.py volume       # check volume
 ./cast2nest.py volume 40    # set volume
 ./cast2nest.py status       # volume and active application
 ./cast2nest.py stop         # stop playback
 ```
+
+During playback, pressing Enter or `n` in the terminal running `play`
+also skips to the next track. This is not available with `play -`,
+because there standard input is the audio. The `next` command can be
+run from another terminal or over SSH while the `play` process keeps
+running.
 
 ### Specify the device manually
 
@@ -137,6 +145,9 @@ The default Cast port is 8009. It can be changed with `--cast-port`.
 - `Ctrl-C` closes the local server. The current track may keep playing on the
   speaker until it finishes or until you use `stop`.
 - When a playlist ends, the program closes the playback application.
+- Skipping a track advances the playlist. Skipping the last track leaves the
+  speaker idle, as when the playlist finishes. `stop` still stops the playback
+  application.
 - Conversions are saved in `~/.cache/cast2nest`.
 - HTTP diagnostics, including file names and served paths, are saved in
   `~/.cache/cast2nest/serve.log`.

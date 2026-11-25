@@ -19,6 +19,7 @@ Usage:
       # entire directory (filtered for audio), or an .m3u/.m3u8 playlist
   python3 cast2nest.py [--host IP] play - < audio.mp3   # pipe from another app
       # raw audio over a pipe: add --raw (or fine-tune with --in-fmt/--in-rate/--in-ch)
+  python3 cast2nest.py [--host IP] next                  # skip to the next track
   python3 cast2nest.py [--host IP] volume LEVEL          # 0..100
   python3 cast2nest.py [--host IP] stop
   python3 cast2nest.py [--host IP] status
@@ -27,7 +28,8 @@ Without --host, discover the Cast device automatically by scanning port 8009 on
 the /24 subnet.
 
 Note: during playback, this process must remain running to serve tracks over
-HTTP. On Ctrl-C, the current track continues on the device until it finishes or
+HTTP. Enter or `n` (or `next` from another terminal) skips to the next track.
+On Ctrl-C, the current track continues on the device until it finishes or
 you use `stop`; at the end of the playlist, the app closes automatically.
 """
 
@@ -294,9 +296,43 @@ class CastSession:
             },
         )
 
-    def monitor(self):
-        """Return True only if the track reached PLAYING and finished without error."""
-        played, last, last_ping, ok = False, None, 0.0, False
+    def send_media(self, transport_id, command):
+        """Send a media command to the playback app and return its request id."""
+        self.req += 1
+        command["requestId"] = self.req
+        self.send(NS_MEDIA, transport_id, command)
+        return self.req
+
+    def wait_media_status(self, request_id):
+        """Wait for the MEDIA_STATUS that answers `request_id`."""
+        return self.wait(
+            lambda m: (
+                m["ns"] == NS_MEDIA
+                and (m["json"] or {}).get("type") == "MEDIA_STATUS"
+                and m["json"].get("requestId") == request_id
+            ),
+            timeout=5,
+        )
+
+    def media_status(self, transport_id):
+        """Media session loaded on `transport_id`, or None when there is none."""
+        rid = self.send_media(transport_id, {"type": "GET_STATUS"})
+        m = self.wait_media_status(rid)
+        statuses = ((m or {}).get("json") or {}).get("status") or []
+        return statuses[0] if statuses else None
+
+    def monitor(self, transport_id, next_requests):
+        """Watch the loaded track until it ends.
+
+        Returns "finished", "skipped", "stopped" or "failed": a track is
+        "skipped" when it is abandoned to move on to the next one (Enter or
+        'n' in the terminal, or `next` from another terminal, which sends the
+        same STOP), and "stopped" when the playback app is gone.
+        """
+        next_requests.forget()  # a request from before this track does not count
+        played, skip_sent, seen_media = False, False, False
+        session_id, skip_deadline, last, last_ping = None, 0.0, None, 0.0
+        result = "failed"
         while True:
             now = time.time()
             if now - last_ping > 4:
@@ -305,7 +341,20 @@ class CastSession:
                 except (ConnectionError, ssl.SSLError, OSError):
                     break
                 last_ping = now
-            if select.select([self.sock], [], [], 1.0)[0]:
+            if skip_sent and now > skip_deadline:
+                result = "skipped"  # the device never confirmed the STOP
+                break
+            if not skip_sent and session_id is not None and next_requests.take():
+                skip_sent, skip_deadline = True, now + 6
+                print("skipping to the next track")
+                try:
+                    self.send_media(
+                        transport_id, {"type": "STOP", "mediaSessionId": session_id}
+                    )
+                except (ConnectionError, ssl.SSLError, OSError):
+                    result = "skipped"
+                    break
+            if select.select([self.sock], [], [], 0.5)[0]:
                 try:
                     m = self.recv_msg(timeout=2)
                 except (ConnectionError, ssl.SSLError, OSError):
@@ -314,7 +363,10 @@ class CastSession:
                             "the device closed the connection before playback "
                             "started (did it reject the file?)"
                         )
-                    ok = played
+                    if skip_sent:
+                        result = "skipped"
+                    elif played:
+                        result = "finished"
                     break
                 if m["ns"] == NS_HB and (m["json"] or {}).get("type") == "PING":
                     self.send(NS_HB, m["src"], {"type": "PONG"})
@@ -331,7 +383,7 @@ class CastSession:
                         "the playback app closed"
                         + ("" if played else " before playback started")
                     )
-                    ok = played
+                    result = "stopped"
                     break
                 if m["ns"] != NS_MEDIA:
                     continue
@@ -342,7 +394,15 @@ class CastSession:
                     break
                 if msg_type != "MEDIA_STATUS":
                     continue
-                s0 = (payload.get("status") or [{}])[0]
+                statuses = payload.get("status") or []
+                if not statuses:  # a STOP invalidated the session: next track
+                    if seen_media or skip_sent:
+                        result = "skipped"
+                        break
+                    continue
+                seen_media = True
+                s0 = statuses[0]
+                session_id = s0.get("mediaSessionId") or session_id
                 ps = s0.get("playerState") or "IDLE"
                 if ps != last:
                     print(f"state: {ps}")
@@ -350,17 +410,21 @@ class CastSession:
                 if ps == "PLAYING":
                     played = True
                 if ps == "IDLE":
-                    if s0.get("idleReason") == "ERROR":
+                    reason = s0.get("idleReason")
+                    if skip_sent or reason in ("CANCELLED", "INTERRUPTED"):
+                        result = "skipped"
+                    elif reason == "ERROR":
                         print(
                             "error: the device could not decode the file "
                             "(unsupported or corrupt format?)"
                         )
-                        break
-                    if played:
+                    elif played:
                         print("playback finished")
-                        ok = True
-                        break
-        return ok
+                        result = "finished"
+                    else:
+                        continue  # IDLE before the track starts is not the end
+                    break
+        return result
 
 
 # ────────────────────────── discovery and networking ──────────────────────────
@@ -973,6 +1037,107 @@ def ensure_app(sess):
     return app
 
 
+class NextRequests:
+    """'Next track' requests from the terminal: Enter or 'n' presses.
+
+    Only one request waits at a time and the track being monitored takes it,
+    so pressing the key over and over never skips more than one track.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.requested = False
+
+    def press(self):
+        with self.lock:
+            self.requested = True
+
+    def take(self):
+        """Consume the pending request, if any, leaving none pending."""
+        with self.lock:
+            requested, self.requested = self.requested, False
+            return requested
+
+    def forget(self):
+        """Drop a pending request: presses outside a track do not count."""
+        with self.lock:
+            self.requested = False
+
+
+def _cbreak(fd):
+    """Put the terminal in cbreak mode so one keypress is enough.
+
+    Returns the undo; identity when termios is missing or the file
+    descriptor is not a terminal.
+    """
+    try:
+        import termios
+    except ImportError:
+        return lambda: None
+    try:
+        saved = termios.tcgetattr(fd)
+        cbreak = termios.tcgetattr(fd)
+        cbreak[3] &= ~(termios.ICANON | termios.ECHO)  # lflags
+        cbreak[6][termios.VMIN] = 1  # one keypress is one read
+        cbreak[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSADRAIN, cbreak)
+    except (OSError, ValueError, termios.error):
+        return lambda: None
+
+    def undo():
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+    return undo
+
+
+def watch_next_key(next_requests):
+    """Request the next track when Enter or 'n' is pressed on the terminal.
+
+    Returns the callable that restores the terminal and stops the watcher;
+    a no-op without a terminal (use `next` from another one).
+    """
+    if not sys.stdin.isatty():
+        return lambda: None
+    fd = sys.stdin.fileno()
+    undo_cbreak = _cbreak(fd)
+    done = threading.Event()
+
+    def watch():
+        while not done.is_set():
+            try:
+                if not select.select([fd], [], [], 0.5)[0]:
+                    continue
+                key = os.read(fd, 1)
+            except (OSError, ValueError):
+                return
+            if not key:
+                return  # the terminal is gone
+            if key in (b"\n", b"\r", b"n", b"N"):
+                next_requests.press()
+
+    threading.Thread(target=watch, daemon=True).start()
+
+    def close():
+        done.set()
+        undo_cbreak()
+
+    return close
+
+
+def close_app(sess):
+    """End of playlist: close the playback app and leave the speaker idle."""
+    try:
+        app = ensure_app(sess)
+        sess.req += 1
+        sess.send(
+            NS_RECV,
+            "receiver-0",
+            {"type": "STOP", "sessionId": app["sessionId"], "requestId": sess.req},
+        )
+    except (ConnectionError, ssl.SSLError, OSError, RuntimeError):
+        pass
+
+
 def cmd_play(host, port_cast, media_args, port_http, stdin_flags=None):
     tracks = expand_media_args(media_args)
     if any(t["media"] == "-" for t in tracks):
@@ -985,8 +1150,15 @@ def cmd_play(host, port_cast, media_args, port_http, stdin_flags=None):
     if not total:
         sys.exit("error: no tracks to play")
     print(f"playlist: {total} track{'s' if total > 1 else ''}")
+    next_requests = NextRequests()
+    restore_terminal = watch_next_key(next_requests)
+    print(
+        "during playback: Enter or 'n' goes to the next track"
+        " (also 'next' from another terminal)"
+    )
     srv = None
     ok_tracks = 0
+    app_closed = False
     try:
         sess = CastSession(host, port_cast)
         app = ensure_app(sess)
@@ -1010,23 +1182,19 @@ def cmd_play(host, port_cast, media_args, port_http, stdin_flags=None):
             print(f"\n[{i}/{total}] {title}")
             print(f"   URL: {url}")
             sess.load(app["transportId"], url, ctype, title)
-            if not sess.monitor():
+            outcome = sess.monitor(app["transportId"], next_requests)
+            if outcome in ("finished", "skipped"):
+                ok_tracks += 1
+            elif outcome == "stopped":
+                app_closed = True
+                break
+            else:
                 print(f"note: skipping track [{i}/{total}]")
-                continue
-            ok_tracks += 1
-        if not ok_tracks:
+        if not ok_tracks and not app_closed:
             print("error: no tracks could be played")
             sys.exit(1)
-        try:  # end of playlist: close the app and leave the speaker idle
-            app = ensure_app(sess)
-            sess.req += 1
-            sess.send(
-                NS_RECV,
-                "receiver-0",
-                {"type": "STOP", "sessionId": app["sessionId"], "requestId": sess.req},
-            )
-        except (ConnectionError, ssl.SSLError, OSError, RuntimeError):
-            pass
+        if not app_closed:
+            close_app(sess)  # end of playlist: leave the speaker idle
         print(f"playlist finished ({ok_tracks}/{total} tracks played)")
     except KeyboardInterrupt:
         print(
@@ -1034,6 +1202,7 @@ def cmd_play(host, port_cast, media_args, port_http, stdin_flags=None):
             " (or until someone stops it)"
         )
     finally:
+        restore_terminal()
         if srv:
             srv.shutdown()
 
@@ -1070,7 +1239,14 @@ def cmd_play_stdin(host, port_cast, flags, port_http):
         url = f"http://{local_ip(host)}:{srv.listen_port}{srv.route}"
         print(f"standard input\n   URL: {url}")
         sess.load(app["transportId"], url, "audio/mpeg", "standard input")
-        if not sess.monitor():
+        outcome = sess.monitor(app["transportId"], NextRequests())
+        if outcome == "finished":
+            print("the stream ended")
+        elif outcome == "skipped":
+            print("the stream was stopped")
+        elif outcome == "stopped":
+            print("the playback app closed")
+        else:
             sys.exit("error: standard input could not be played")
     except KeyboardInterrupt:
         print(
@@ -1082,6 +1258,27 @@ def cmd_play_stdin(host, port_cast, flags, port_http):
             proc.terminate()
         buf.end()
         srv.shutdown()
+
+
+def cmd_next(host, port_cast):
+    """next: stop the current track so the running playlist moves on."""
+    sess = CastSession(host, port_cast)
+    apps = sess.get_status().get("applications", [])
+    app = next((a for a in apps if a.get("appId") == APP_DEFAULT), None)
+    if not app:
+        reason = "nothing is playing" if not apps else "cast2nest is not playing"
+        print(f"note: {reason}")
+        return
+    media = sess.media_status(app["transportId"])
+    if not media:
+        print("note: nothing is playing")
+        return
+    rid = sess.send_media(
+        app["transportId"],
+        {"type": "STOP", "mediaSessionId": media.get("mediaSessionId")},
+    )
+    confirmed = sess.wait_media_status(rid) is not None
+    print("next" + (" confirmed" if confirmed else " sent"))
 
 
 def cmd_volume(host, port_cast, level):
@@ -1195,6 +1392,7 @@ def main():
   ... | %(prog)s play - --in-fmt f32le --in-rate 44100 --in-ch 2
 
 device control:
+  %(prog)s next          # skip to the next track of the playing playlist
   %(prog)s volume        # show current volume (and mute status)
   %(prog)s volume 40     # set volume to 0..100
   %(prog)s stop          # stop playback
@@ -1202,6 +1400,8 @@ device control:
   %(prog)s --host 192.168.1.138 play ...   # skip discovery
 
 behavior:
+  - during playback: Enter or 'n' on this terminal, or `next` from another one,
+    goes to the next track
   - during playback, the process stays alive to serve file(s) over HTTP (:8099)
   - Ctrl-C: the current track continues on the device until it finishes (or `stop`)
   - end of playlist: sends STOP and releases the speaker
@@ -1228,6 +1428,7 @@ behavior:
     p.add_argument("--in-fmt", help="'-': raw input format (e.g. s16le, f32le)")
     p.add_argument("--in-rate", type=int, help="'-': input sample rate (e.g. 44100)")
     p.add_argument("--in-ch", type=int, help="'-': input channel count (e.g. 2)")
+    p = sub.add_parser("next", help="skip to the next track of the playing playlist")
     p = sub.add_parser("volume", help="level 0..100; without a value: query only")
     p.add_argument("level", nargs="?", type=float)
     p = sub.add_parser("stop", help="stop playback")
@@ -1244,6 +1445,8 @@ behavior:
             flags["rate"] = args.in_rate or (48000 if args.raw else None)
             flags["ch"] = args.in_ch or (2 if args.raw else None)
         cmd_play(host, args.cast_port, args.media, args.http_port, flags)
+    elif args.cmd == "next":
+        cmd_next(host, args.cast_port)
     elif args.cmd == "volume":
         cmd_volume(host, args.cast_port, args.level)
     elif args.cmd == "stop":
